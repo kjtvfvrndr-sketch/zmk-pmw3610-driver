@@ -361,6 +361,17 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         err = pmw3610_set_cpi(dev, config->cpi, config->swap_xy, config->inv_x, config->inv_y);
     }
 
+	/* Восстановление поведения апстрима inorichi/zmk-pmw3610-driver:
+	* PERFORMANCE (0x11) пишется безусловно — старший ниббл (force-mode) = 0x0,
+	* младший = 0x0d (250 Hz). Совпадает с PERFORMANCE_INIT из штатной прошивки
+	* RMK. Форки Ergohaven/badjeff убрали эту запись под `if (config->force_awake)`,
+	* из-за чего без force-awake регистр не трогается вообще и остаётся в том
+	* состоянии, в котором чип поднялся после POWER_UP_RESET. */
+	if (!err) {
+		err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, 0x0d);
+		LOG_INF("Set performance register (reg value 0x%x)", 0x0d);
+	}
+	
     if (!err) {
         err = pmw3610_set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
                                          CONFIG_PMW3610_ALT_RUN_DOWNSHIFT_TIME_MS);
