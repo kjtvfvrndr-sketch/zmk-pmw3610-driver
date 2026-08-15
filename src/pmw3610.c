@@ -707,6 +707,18 @@ static const struct device *pmw3610_devs[] = {
     DT_FOREACH_STATUS_OKAY(pixart_pmw3610_alt, GET_PMW3610_DEV)
 };
 
+/* Даташит PMW3610DM-SUDU: 0x3b SHUTDOWN, write-only, потребление 3 мкА.
+ * Клок SPI у сенсора гейтится, перед записью его надо запросить.
+ * Обычный pmw3610_write() (строки 85-96) после записи пытается клок
+ * выключить — но чип к этому моменту уже погашен, поэтому вручную. */
+static int pmw3610_shutdown(const struct device *dev) {
+    pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_ENABLE);
+    k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
+    return pmw3610_write_reg(dev, PMW3610_REG_SHUTDOWN, PMW3610_REG_SHUTDOWN_CMD);
+}
+
+static enum zmk_activity_state prev_activity_state = ZMK_ACTIVITY_ACTIVE;
+
 static int on_activity_state(const zmk_event_t *eh) {
     struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
 
@@ -715,10 +727,35 @@ static int on_activity_state(const zmk_event_t *eh) {
         return 0;
     }
 
-    bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-        pmw3610_set_performance(pmw3610_devs[i], enable);
+        const struct device *dev = pmw3610_devs[i];
+        struct pixart_data *data = dev->data;
+
+        if (state_ev->state == ZMK_ACTIVITY_SLEEP) {
+            /* activity.c:80-88 — событие поднимается до zmk_pm_suspend_devices()
+             * и до sys_poweroff(), SPI0 ещё жив, запись успевает пройти. */
+            if (data->ready) {
+                LOG_INF("Sensor shutdown before deep sleep");
+                pmw3610_shutdown(dev);
+                data->ready = false;  /* закрывает SPI обработчикам, строки 430 и 606 */
+            }
+            continue;
+        }
+
+        if (prev_activity_state == ZMK_ACTIVITY_SLEEP) {
+            /* Достижимо только если zmk_pm_suspend_devices() дал сбой и
+             * poweroff не состоялся (activity.c:82-86). После штатного
+             * System OFF чип перезагружается и init идёт с нуля сам. */
+            LOG_INF("Sensor wake-up: restarting async init");
+            data->async_init_step = 0;
+            k_work_schedule(&data->init_work, K_MSEC(async_init_delay[0]));
+            continue;
+        }
+
+        pmw3610_set_performance(dev, state_ev->state == ZMK_ACTIVITY_ACTIVE);
     }
+
+    prev_activity_state = state_ev->state;
 
     return 0;
 }
