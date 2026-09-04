@@ -11,11 +11,94 @@
 #include <zephyr/input/input.h>
 #include <zephyr/pm/device.h>
 #include <zmk/keymap.h>
+#include <zmk/event_manager.h>
+#include <zmk/endpoints.h>
 #include <zmk/events/activity_state_changed.h>
+#include <zmk/events/endpoint_changed.h>
+#if IS_ENABLED(CONFIG_BT)
+#include <zephyr/bluetooth/conn.h>
+#endif
 #include "pmw3610.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
+
+//////// Report interval, adapted to the active endpoint //////////
+// USB and BLE cap the achievable report rate very differently,   //
+// and BLE hosts disagree among themselves (7.5 ms on Windows,    //
+// 15 ms on macOS). Follow the active endpoint and, on BLE, the   //
+// connection interval actually negotiated with the host, so the  //
+// driver never produces more reports than the link can carry.    //
+
+static atomic_t rpt_interval_min = ATOMIC_INIT(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE);
+static atomic_t ble_interval_min = ATOMIC_INIT(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE);
+
+static void pmw3610_refresh_report_interval(void) {
+    int32_t v = atomic_get(&ble_interval_min);
+
+#if IS_ENABLED(CONFIG_ZMK_USB)
+    if (zmk_endpoints_selected().transport == ZMK_TRANSPORT_USB) {
+        v = CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_USB;
+    }
+#endif
+
+    if (atomic_set(&rpt_interval_min, v) != v) {
+        LOG_INF("Report interval min -> %d ms", v);
+    }
+}
+
+#if IS_ENABLED(CONFIG_BT)
+static void pmw3610_track_conn(struct bt_conn *conn) {
+    struct bt_conn_info info;
+
+    if (bt_conn_get_info(conn, &info) != 0 || info.type != BT_CONN_TYPE_LE) {
+        return;
+    }
+
+    /* Only the host link matters. On a split central the other LE connection
+       is the peripheral half, and its interval must not be picked up here. */
+    if (info.role != BT_CONN_ROLE_PERIPHERAL) {
+        return;
+    }
+
+    /* le.interval is in 1.25 ms units; round up so the driver never emits
+       reports faster than the link is able to carry them. */
+    int32_t ms = ((int32_t)info.le.interval * 5 + 3) / 4;
+    atomic_set(&ble_interval_min, MAX(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE, ms));
+    pmw3610_refresh_report_interval();
+}
+
+static void pmw3610_connected(struct bt_conn *conn, uint8_t err) {
+    /* le_param_updated only fires on an actual update procedure, which some
+       hosts never run, so sample the interval on connect as well. */
+    if (err == 0) {
+        pmw3610_track_conn(conn);
+    }
+}
+
+static void pmw3610_le_param_updated(struct bt_conn *conn, uint16_t interval, uint16_t latency,
+                                     uint16_t timeout) {
+    ARG_UNUSED(interval);
+    ARG_UNUSED(latency);
+    ARG_UNUSED(timeout);
+    pmw3610_track_conn(conn);
+}
+
+BT_CONN_CB_DEFINE(pmw3610_conn_cb) = {
+    .connected = pmw3610_connected,
+    .le_param_updated = pmw3610_le_param_updated,
+};
+#endif
+
+static int pmw3610_endpoint_listener(const zmk_event_t *eh) {
+    if (as_zmk_endpoint_changed(eh) != NULL) {
+        pmw3610_refresh_report_interval();
+    }
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(pmw3610_endpoint, pmw3610_endpoint_listener);
+ZMK_SUBSCRIPTION(pmw3610_endpoint, zmk_endpoint_changed);
 
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
@@ -409,6 +492,10 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         return err;
     }
 
+    /* The endpoint-changed event only fires on a later switch, so pick up
+       whichever endpoint is already active at boot. */
+    pmw3610_refresh_report_interval();
+
     return 0;
 }
 
@@ -445,9 +532,8 @@ static int pmw3610_report_data(const struct device *dev) {
         return -EBUSY;
     }
 
-#if CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN > 0
-    int64_t now = k_uptime_get();
-#endif
+    const int32_t rpt_min = atomic_get(&rpt_interval_min);
+    const int64_t now = k_uptime_get();
 
 	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, PMW3610_BURST_SIZE);
     if (err) {
@@ -476,25 +562,21 @@ static int pmw3610_report_data(const struct device *dev) {
     }
 #endif
 
-#if CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN > 0
     // purge accumulated delta, if last sampled had not been reported on last report tick
-    if (now - data->last_smp_time >= CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN) {
+    if (rpt_min > 0 && (now - data->last_smp_time) >= rpt_min) {
         data->dx = 0;
         data->dy = 0;
     }
     data->last_smp_time = now;
-#endif
 
     // accumulate delta until report in next iteration
     data->dx += x;
     data->dy += y;
 
-#if CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN > 0
     // strict to report inerval
-    if (now - data->last_rpt_time < CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN) {
+    if (rpt_min > 0 && (now - data->last_rpt_time) < rpt_min) {
         return 0;
     }
-#endif
 
     // fetch report value
     int16_t rx = (int16_t)CLAMP(data->dx, INT16_MIN, INT16_MAX);
@@ -503,9 +585,7 @@ static int pmw3610_report_data(const struct device *dev) {
     bool have_y = ry != 0;
 
     if (have_x || have_y) {
-#if CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN > 0
         data->last_rpt_time = now;
-#endif
         data->dx = 0;
         data->dy = 0;
         if (have_x) {
@@ -577,10 +657,8 @@ static int pmw3610_init(const struct device *dev) {
     data->dev = dev;
     data->dx = 0;
     data->dy = 0;
-#if CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN > 0
     data->last_smp_time = 0;
     data->last_rpt_time = 0;
-#endif
 
     // init smart algorithm flag;
     data->sw_smart_flag = false;

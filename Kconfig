@@ -43,6 +43,21 @@ config PMW3610_ALT_REPORT_INTERVAL_MIN
 		Slow down input reporting for hid queue over the air.
 		Turn value down to 8ms to get sharp response if use with USB only.
 
+config PMW3610_ALT_REPORT_INTERVAL_MIN_USB
+	int "Minimum report interval while the active endpoint is USB (ms)"
+	default 0
+	help
+	  Minimum report interval applied while reporting over USB.
+	  0 disables throttling and yields the full sensor frame rate.
+
+config PMW3610_ALT_REPORT_INTERVAL_MIN_BLE
+	int "Minimum report interval floor while reporting over BLE (ms)"
+	default PMW3610_ALT_REPORT_INTERVAL_MIN
+	help
+	  Lower bound for the report interval while reporting over BLE.
+	  The effective value follows the connection interval negotiated
+	  with the host, and is never allowed below this floor.
+
 config PMW3610_ALT_SMART_ALGORITHM
   bool "Enable an algorithm of PMW3610 to enhance surface coverage"
   default y
