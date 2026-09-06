@@ -58,6 +58,14 @@ config PMW3610_ALT_REPORT_INTERVAL_MIN_BLE
 	  The effective value follows the connection interval negotiated
 	  with the host, and is never allowed below this floor.
 
+config PMW3610_ALT_REPORT_INTERVAL_FOLLOW_CONN
+	bool "Raise the BLE report interval to the negotiated connection interval"
+	default n
+	help
+	  Off by default: BLE carries several notifications per connection
+	  event, so the connection interval is not the delivery ceiling and
+	  following it throttles reports more than necessary.
+
 config PMW3610_ALT_SMART_ALGORITHM
   bool "Enable an algorithm of PMW3610 to enhance surface coverage"
   default y

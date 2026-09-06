@@ -47,7 +47,7 @@ static void pmw3610_refresh_report_interval(void) {
     }
 }
 
-#if IS_ENABLED(CONFIG_BT)
+#if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_PMW3610_ALT_REPORT_INTERVAL_FOLLOW_CONN)
 static void pmw3610_track_conn(struct bt_conn *conn) {
     struct bt_conn_info info;
 
