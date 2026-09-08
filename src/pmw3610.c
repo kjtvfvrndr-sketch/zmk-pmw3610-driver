@@ -178,6 +178,36 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val) {
     return 0;
 }
 
+/* Пишет регистр и перечитывает его. Сенсор может ещё не закончить
+   внутренний power-up, тогда запись теряется молча. */
+static int pmw3610_write_verified(const struct device *dev, uint8_t reg, uint8_t val) {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        int err = pmw3610_write(dev, reg, val);
+        if (err) {
+            LOG_ERR("reg 0x%02x: write failed %d (attempt %d)", reg, err, attempt);
+            return err;
+        }
+
+        uint8_t rb = 0xFF;
+        err = pmw3610_read_reg(dev, reg, &rb);
+        if (err) {
+            LOG_ERR("reg 0x%02x: readback failed %d", reg, err);
+            return err;
+        }
+
+        if (rb == val) {
+            if (attempt > 1) {
+                LOG_WRN("reg 0x%02x: settled as 0x%02x on attempt %d", reg, rb, attempt);
+            }
+            return 0;
+        }
+
+        LOG_ERR("reg 0x%02x: wrote 0x%02x, read back 0x%02x (attempt %d)", reg, val, rb, attempt);
+        k_msleep(10);
+    }
+    return -EIO;
+}
+
 static int pmw3610_set_cpi(const struct device *dev, uint32_t cpi, 
                            bool swap_xy, bool inv_x, bool inv_y) {
     /* Set resolution with CPI step of 200 cpi
@@ -266,7 +296,7 @@ static int pmw3610_set_sample_time(const struct device *dev, uint8_t reg_addr, u
     LOG_INF("Set sample time to %u ms (reg value: 0x%x)", sample_time, value);
 
     /* The sample time is (reg_value * mintime ) ms. 0x00 is rounded to 0x1 */
-    int err = pmw3610_write(dev, reg_addr, value);
+    int err = pmw3610_write_verified(dev, reg_addr, value);
     if (err) {
         LOG_ERR("Failed to change sample time");
     }
@@ -326,7 +356,7 @@ static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr
 
     LOG_INF("Set downshift time to %u ms (reg value 0x%x)", time, value);
 
-    int err = pmw3610_write(dev, reg_addr, value);
+    int err = pmw3610_write_verified(dev, reg_addr, value);
     if (err) {
         LOG_ERR("Failed to change downshift time");
     }
@@ -452,9 +482,7 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         uint8_t old = 0xFF;
         pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &old);
         LOG_INF("Performance register: 0x%02x -> 0x0d", old);
-        if (old != 0x0d) {
-            err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, 0x0d);
-        }
+        err = pmw3610_write_verified(dev, PMW3610_REG_PERFORMANCE, 0x0d);
     }
 	
     if (!err) {
