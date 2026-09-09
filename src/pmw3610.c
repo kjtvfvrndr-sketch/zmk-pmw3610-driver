@@ -20,8 +20,42 @@
 #endif
 #include "pmw3610.h"
 
+#include <string.h>
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
+
+/* Frame-rate diagnostics + dedicated work queue.
+ *
+ * The motion interrupt is re-armed only after the work item has finished, so
+ * if scheduling latency plus work duration exceed the sensor frame period the
+ * next frame is missed outright and the effective rate halves.  Run the sensor
+ * work on its own cooperative queue (priority -2, just above the system work
+ * queue at -1) and measure the inter-frame interval directly.
+ */
+#define PMW3610_DIAG_PRIO       (-2)
+#define PMW3610_DIAG_STACK_SIZE 1024
+#define PMW3610_DIAG_PERIOD     K_SECONDS(2)
+
+/* Frame-rate watchdog.
+ *
+ * A stuck sensor halves its frame rate, so the shortest possible gap becomes
+ * 8 ms and the 4 ms bucket empties completely.  Slow ball movement also
+ * produces long gaps, but any burst of quick motion still lands in the 4 ms
+ * bucket - in eight reference windows with n >= 15 the 4 ms bucket was never
+ * empty (31/33, 89/91, 45/53, 43/46, 13/15, 40/41).  Require several
+ * consecutive empty windows so a slow stretch cannot trip it.
+ */
+#define PMW3610_WD_MIN_SAMPLES  15
+#define PMW3610_WD_STREAK       5
+#define PMW3610_WD_HOLDOFF_MS   60000
+
+/* k_cyc_to_us_near32() overflows a few milliseconds in at 32768 Hz - go 64-bit. */
+#define PMW3610_CYC_TO_US(c) ((uint32_t)k_cyc_to_us_near64((uint64_t)(uint32_t)(c)))
+
+K_THREAD_STACK_DEFINE(pmw3610_diag_stack, PMW3610_DIAG_STACK_SIZE);
+static struct k_work_q pmw3610_workq;
+static bool pmw3610_workq_started;
 
 //////// Report interval, adapted to the active endpoint //////////
 // USB and BLE cap the achievable report rate very differently,   //
@@ -545,7 +579,8 @@ static void pmw3610_async_init(struct k_work *work) {
             LOG_INF("PMW3610 initialized");
             pmw3610_set_interrupt(dev, true);
         } else {
-            k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+            k_work_schedule_for_queue(&pmw3610_workq, &data->init_work,
+                                      K_MSEC(async_init_delay[data->async_init_step]));
         }
     }
 }
@@ -632,14 +667,111 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
     struct pixart_data *data = CONTAINER_OF(cb, struct pixart_data, irq_gpio_cb);
     const struct device *dev = data->dev;
     pmw3610_set_interrupt(dev, false);
-    k_work_submit(&data->trigger_work);
+    data->irq_ticks = k_cycle_get_32();
+    k_work_submit_to_queue(&pmw3610_workq, &data->trigger_work);
+}
+
+/* Re-run the async init state machine.  A full reboot is known to clear the
+ * stuck frame rate, and this is what a reboot does to the sensor.  The
+ * interrupt is disarmed first and data->ready gates pmw3610_report_data(), so
+ * motion work cannot touch the SPI bus while the sequence runs. */
+static void pmw3610_reinit(struct pixart_data *data) {
+    pmw3610_set_interrupt(data->dev, false);
+    data->ready = false;
+    data->async_init_step = 0;
+    data->last_reinit_ms = k_uptime_get();
+    k_work_schedule_for_queue(&pmw3610_workq, &data->init_work,
+                              K_MSEC(async_init_delay[0]));
 }
 
 static void pmw3610_work_callback(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work, struct pixart_data, trigger_work);
     const struct device *dev = data->dev;
+
+    uint32_t t0 = k_cycle_get_32();
+    uint32_t delta_us = PMW3610_CYC_TO_US(t0 - data->prev_cb);
+    uint32_t sched_us = PMW3610_CYC_TO_US(t0 - data->irq_ticks);
+    data->prev_cb = t0;
+
     pmw3610_report_data(dev);
     pmw3610_set_interrupt(dev, true);
+
+    uint32_t work_us = PMW3610_CYC_TO_US(k_cycle_get_32() - t0);
+
+    /* The inter-frame interval is the primary observable: a missed frame shows
+     * up as an exact doubling, never as an intermediate value. */
+    if (delta_us < data->min_delta_us) {
+        data->min_delta_us = delta_us;
+    }
+
+    if (delta_us < 6000) {
+        data->delta_buckets[0]++;   /* 4 ms - nominal */
+    } else if (delta_us < 10000) {
+        data->delta_buckets[1]++;   /* 8 ms - one frame lost */
+    } else if (delta_us < 20000) {
+        data->delta_buckets[2]++;   /* 16 ms - two frames lost */
+    } else {
+        data->delta_buckets[3]++;   /* slower - idle gap or REST mode */
+    }
+
+    if (sched_us > data->sched_worst_us) {
+        data->sched_worst_us = sched_us;
+    }
+    if (work_us > data->work_worst_us) {
+        data->work_worst_us = work_us;
+    }
+}
+
+/* Runs on the same queue as the motion work, so the SPI bus stays serialised.
+ * Reading PERFORMANCE here rather than in pmw3610_report_data() keeps the SPI
+ * transaction out of the hot path, where it would perturb what we measure. */
+static void pmw3610_diag_dump(struct k_work *work) {
+    struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+    struct pixart_data *data = CONTAINER_OF(dwork, struct pixart_data, diag_work);
+    uint32_t *b = data->delta_buckets;
+    uint32_t n = b[0] + b[1] + b[2] + b[3];
+
+    if (n > 0 && data->ready) {
+        uint8_t perf = 0xFF;
+        pmw3610_read_reg(data->dev, PMW3610_REG_PERFORMANCE, &perf);
+
+        LOG_INF("diag perf=0x%02x n=%u | 4ms=%u 8ms=%u 16ms=%u slow=%u | "
+                "min=%uus sched_max=%uus work_max=%uus",
+                perf, n, b[0], b[1], b[2], b[3],
+                data->min_delta_us, data->sched_worst_us, data->work_worst_us);
+
+        bool suspicious = (n >= PMW3610_WD_MIN_SAMPLES) && (b[0] == 0);
+
+        if (suspicious) {
+            data->stuck_streak++;
+        } else {
+            data->stuck_streak = 0;
+        }
+
+        if (data->stuck_streak >= PMW3610_WD_STREAK) {
+            int64_t now = k_uptime_get();
+            bool armed = IS_ENABLED(CONFIG_PMW3610_ALT_FRAME_WATCHDOG_ACTION);
+            bool cooled = (data->last_reinit_ms == 0) ||
+                          (now - data->last_reinit_ms > PMW3610_WD_HOLDOFF_MS);
+
+            LOG_WRN("frame rate stuck: %u windows, min gap %u us, perf=0x%02x%s",
+                    data->stuck_streak, data->min_delta_us, perf,
+                    armed ? (cooled ? " -> re-init" : " -> holdoff")
+                          : " -> detect only");
+
+            data->stuck_streak = 0;
+            if (armed && cooled) {
+                pmw3610_reinit(data);
+            }
+        }
+
+        memset(data->delta_buckets, 0, sizeof(data->delta_buckets));
+        data->sched_worst_us = 0;
+        data->work_worst_us = 0;
+        data->min_delta_us = UINT32_MAX;
+    }
+
+    k_work_reschedule_for_queue(&pmw3610_workq, &data->diag_work, PMW3610_DIAG_PERIOD);
 }
 
 static int pmw3610_init_irq(const struct device *dev) {
@@ -691,8 +823,22 @@ static int pmw3610_init(const struct device *dev) {
     // init smart algorithm flag;
     data->sw_smart_flag = false;
 
+    // dedicated cooperative work queue, shared by all driver instances
+    if (!pmw3610_workq_started) {
+        k_work_queue_start(&pmw3610_workq, pmw3610_diag_stack,
+                           K_THREAD_STACK_SIZEOF(pmw3610_diag_stack),
+                           PMW3610_DIAG_PRIO, NULL);
+        k_thread_name_set(&pmw3610_workq.thread, "pmw3610");
+        pmw3610_workq_started = true;
+    }
+
     // init trigger handler work
     k_work_init(&data->trigger_work, pmw3610_work_callback);
+
+    // periodic frame-rate diagnostics
+    k_work_init_delayable(&data->diag_work, pmw3610_diag_dump);
+    k_work_reschedule_for_queue(&pmw3610_workq, &data->diag_work, PMW3610_DIAG_PERIOD);
+    data->min_delta_us = UINT32_MAX;
 
     // init irq routine
     err = pmw3610_init_irq(dev);
@@ -707,7 +853,8 @@ static int pmw3610_init(const struct device *dev) {
     // The sensor is ready to work (i.e., data->ready=true after the above steps are finished)
     k_work_init_delayable(&data->init_work, pmw3610_async_init);
 
-    k_work_schedule(&data->init_work, K_MSEC(async_init_delay[data->async_init_step]));
+    k_work_schedule_for_queue(&pmw3610_workq, &data->init_work,
+                              K_MSEC(async_init_delay[data->async_init_step]));
 
     return err;
 }

@@ -122,3 +122,12 @@ module-str = PMW3610_ALT
 source "${ZEPHYR_BASE}/subsys/logging/Kconfig.template.log_config"
 
 endif #PMW3610_ALT
+
+config PMW3610_ALT_FRAME_WATCHDOG_ACTION
+	bool "Re-initialise the sensor when the frame rate is stuck"
+	default n
+	help
+	  Off by default: the watchdog only logs what it would have done.
+	  Confirm the detection fires when the fault is present and stays
+	  silent otherwise before enabling the re-init, which costs about
+	  320 ms of frozen cursor each time it runs.

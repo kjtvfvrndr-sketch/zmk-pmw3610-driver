@@ -32,6 +32,19 @@ struct pixart_data {
 
     bool                         ready; // whether init is finished successfully
     int                          err; // error code during async init
+
+    /* --- frame-rate diagnostics --- */
+    volatile uint32_t            irq_ticks;        // cycle stamp taken in the motion ISR
+    uint32_t                     prev_cb;          // cycle stamp of the previous callback
+    uint32_t                     delta_buckets[4]; // inter-frame interval histogram
+    uint32_t                     sched_worst_us;   // worst ISR -> callback latency
+    uint32_t                     work_worst_us;    // worst callback duration
+    uint32_t                     min_delta_us;     // shortest inter-frame gap in window
+    struct k_work_delayable      diag_work;        // periodic histogram dump
+
+    /* --- frame-rate watchdog --- */
+    uint8_t                      stuck_streak;     // consecutive suspicious windows
+    int64_t                      last_reinit_ms;   // rate limit for re-init
 };
 
 // device config data structure
