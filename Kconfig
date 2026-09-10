@@ -50,6 +50,21 @@ config PMW3610_ALT_REPORT_INTERVAL_MIN_USB
 	  Minimum report interval applied while reporting over USB.
 	  0 disables throttling and yields the full sensor frame rate.
 
+config PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER
+	bool "Keep the sensor in RUN mode while the board is on USB power"
+	default n
+	help
+	  With the cable in there is no battery to save, so the sensor is pinned
+	  in RUN and never downshifts into REST1. Removes the wake-up lag on the
+	  first motion after a pause. The trigger is the cable, not the selected
+	  output: a plugged-in board stays in RUN whichever endpoint is active.
+	  Battery operation is unaffected -- the RUN downshift timing applies as
+	  soon as the cable is out. The idle activity state does not release the
+	  force either, since idle saves nothing while on mains power.
+
+	  To force the sensor awake on battery as well, use the force-awake
+	  devicetree property on the sensor node instead.
+
 config PMW3610_ALT_REPORT_INTERVAL_MIN_BLE
 	int "Minimum report interval floor while reporting over BLE (ms)"
 	default PMW3610_ALT_REPORT_INTERVAL_MIN

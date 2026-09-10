@@ -13,8 +13,13 @@
 #include <zmk/keymap.h>
 #include <zmk/event_manager.h>
 #include <zmk/endpoints.h>
+#include <zmk/activity.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/events/endpoint_changed.h>
+#if IS_ENABLED(CONFIG_ZMK_USB)
+#include <zmk/usb.h>
+#include <zmk/events/usb_conn_state_changed.h>
+#endif
 #if IS_ENABLED(CONFIG_BT)
 #include <zephyr/bluetooth/conn.h>
 #endif
@@ -49,6 +54,14 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 #define PMW3610_WD_MIN_SAMPLES  15
 #define PMW3610_WD_STREAK       5
 #define PMW3610_WD_HOLDOFF_MS   60000
+
+/* Accumulated but unreported delta is dropped once it is older than this.
+ * Tied to perception, not to the report interval: below it the residue is the
+ * tail of the stroke still in progress, above it emitting it reads as a jump. */
+#define PMW3610_STALE_DELTA_MS 50
+
+/* Dead band around the smart-algorithm shutter threshold of 45. */
+#define PMW3610_SMART_HYST 5
 
 /* k_cyc_to_us_near32() overflows a few milliseconds in at 32768 Hz - go 64-bit. */
 #define PMW3610_CYC_TO_US(c) ((uint32_t)k_cyc_to_us_near64((uint64_t)(uint32_t)(c)))
@@ -134,6 +147,34 @@ static int pmw3610_endpoint_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(pmw3610_endpoint, pmw3610_endpoint_listener);
 ZMK_SUBSCRIPTION(pmw3610_endpoint, zmk_endpoint_changed);
 
+//////// Force-awake while the board runs on USB power ////////
+// On battery, letting the sensor downshift into REST1 is the  //
+// whole point of the downshift timing. On USB there is no     //
+// power to save, so the sensor is pinned in RUN and the        //
+// wake-up lag on the first motion after a pause disappears.    //
+
+static bool pmw3610_want_force_awake(const struct device *dev) {
+    const struct pixart_config *config = dev->config;
+
+    /* The devicetree property keeps its original meaning: force whenever
+       active, on any transport. It can hold on battery, so idle releases it. */
+    if (config->force_awake) {
+        return zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE;
+    }
+
+#if IS_ENABLED(CONFIG_PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER) && IS_ENABLED(CONFIG_ZMK_USB)
+    /* Cable presence, not the selected endpoint: what makes REST pointless is
+       mains power, and that is there whichever output happens to be active.
+       Not gated on the activity state either -- idle saves nothing on mains,
+       while releasing the force on idle would put the lag back on the first
+       stroke after every return. It cannot carry into deep sleep regardless:
+       is_usb_power_present() blocks ZMK_ACTIVITY_SLEEP while the cable is in. */
+    return zmk_usb_is_powered();
+#else
+    return false;
+#endif
+}
+
 //////// Sensor initialization steps definition //////////
 // init is done in non-blocking manner (i.e., async), a //
 // delayable work is defined for this purpose           //
@@ -204,12 +245,12 @@ static int pmw3610_write(const struct device *dev, uint8_t reg, uint8_t val) {
 	k_sleep(K_USEC(T_CLOCK_ON_DELAY_US));
 
     int err = pmw3610_write_reg(dev, reg, val);
-    if (unlikely(err != 0)) {
-        return err;
-    }
-    
+
+    /* The clock request is released on the error path too. It is best effort:
+       if the bus is broken this write fails as well, but leaving the sensor
+       clock forced on is the one outcome worth ruling out. */
     pmw3610_write_reg(dev, PMW3610_REG_SPI_CLK_ON_REQ, PMW3610_SPI_CLOCK_CMD_DISABLE);
-    return 0;
+    return err;
 }
 
 /* Пишет регистр и перечитывает его. Сенсор может ещё не закончить
@@ -341,6 +382,42 @@ static int pmw3610_set_sample_time(const struct device *dev, uint8_t reg_addr, u
 /* Set downshift time in ms. */
 // NOTE: The unit of run-mode downshift is related to pos mode rate, which is hard coded to be 4 ms
 // The pos-mode rate is configured in pmw3610_async_init_configure
+/* The REST downshift ranges below are derived from the matching sample time,
+ * so a plausible-looking pair of Kconfig values can be rejected at runtime --
+ * which aborts async init and leaves the sensor dead with only a log line to
+ * say why. All four values are compile-time constants, so check them here. */
+BUILD_ASSERT(CONFIG_PMW3610_ALT_RUN_DOWNSHIFT_TIME_MS >= 32 &&
+                 CONFIG_PMW3610_ALT_RUN_DOWNSHIFT_TIME_MS <= 8160,
+             "PMW3610_ALT_RUN_DOWNSHIFT_TIME_MS must be within 32..8160 ms");
+
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST1_SAMPLE_TIME_MS >= 10 &&
+                 CONFIG_PMW3610_ALT_REST1_SAMPLE_TIME_MS <= 2550,
+             "PMW3610_ALT_REST1_SAMPLE_TIME_MS must be within 10..2550 ms");
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST2_SAMPLE_TIME_MS >= 10 &&
+                 CONFIG_PMW3610_ALT_REST2_SAMPLE_TIME_MS <= 2550,
+             "PMW3610_ALT_REST2_SAMPLE_TIME_MS must be within 10..2550 ms");
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST3_SAMPLE_TIME_MS >= 10 &&
+                 CONFIG_PMW3610_ALT_REST3_SAMPLE_TIME_MS <= 2550,
+             "PMW3610_ALT_REST3_SAMPLE_TIME_MS must be within 10..2550 ms");
+
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST1_DOWNSHIFT_TIME_MS >=
+                 16 * CONFIG_PMW3610_ALT_REST1_SAMPLE_TIME_MS,
+             "PMW3610_ALT_REST1_DOWNSHIFT_TIME_MS must be at least 16x "
+             "PMW3610_ALT_REST1_SAMPLE_TIME_MS -- raise the downshift or lower the sample time");
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST1_DOWNSHIFT_TIME_MS <=
+                 255 * 16 * CONFIG_PMW3610_ALT_REST1_SAMPLE_TIME_MS,
+             "PMW3610_ALT_REST1_DOWNSHIFT_TIME_MS must be at most 4080x "
+             "PMW3610_ALT_REST1_SAMPLE_TIME_MS");
+
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST2_DOWNSHIFT_TIME_MS >=
+                 128 * CONFIG_PMW3610_ALT_REST2_SAMPLE_TIME_MS,
+             "PMW3610_ALT_REST2_DOWNSHIFT_TIME_MS must be at least 128x "
+             "PMW3610_ALT_REST2_SAMPLE_TIME_MS -- raise the downshift or lower the sample time");
+BUILD_ASSERT(CONFIG_PMW3610_ALT_REST2_DOWNSHIFT_TIME_MS <=
+                 255 * 128 * CONFIG_PMW3610_ALT_REST2_SAMPLE_TIME_MS,
+             "PMW3610_ALT_REST2_DOWNSHIFT_TIME_MS must be at most 32640x "
+             "PMW3610_ALT_REST2_SAMPLE_TIME_MS");
+
 static int pmw3610_set_downshift_time(const struct device *dev, uint8_t reg_addr, uint32_t time) {
     uint32_t maxtime;
     uint32_t mintime;
@@ -402,14 +479,14 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
     const struct pixart_config *config = dev->config;
     int err = 0;
 
-    if (config->force_awake) {
+    if (config->force_awake || IS_ENABLED(CONFIG_PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER)) {
         uint8_t value;
         err = pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &value);
         if (err) {
             LOG_ERR("Can't read ref-performance %d", err);
             return err;
         }
-        LOG_INF("Get performance register (reg value 0x%x)", value);
+        LOG_DBG("Get performance register (reg value 0x%x)", value);
 
         // Set prefered RUN RATE        
         //   BIT 3:   VEL_RUNRATE    0x0: 8ms; 0x1 4ms;
@@ -427,14 +504,17 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
             perf |= 0xF0; // set bit[3..0] to 0xF (force awake)
         }
         if (perf != value) {
-            err = pmw3610_write(dev, PMW3610_REG_PERFORMANCE, perf);
+            /* Verified: a silently lost write here means force-awake does not
+               work at all, and the read-back also proves the high nibble is
+               writable on this part. */
+            err = pmw3610_write_verified(dev, PMW3610_REG_PERFORMANCE, perf);
             if (err) {
                 LOG_ERR("Can't write performance register %d", err);
                 return err;
             }
-            LOG_INF("Set performance register (reg value 0x%x)", perf);
+            LOG_INF("%s performance mode (reg 0x%02x -> 0x%02x)",
+                    enabled ? "enable" : "disable", value, perf);
         }
-        LOG_INF("%s performance mode", enabled ? "enable" : "disable");
     }
 
     return err;
@@ -501,10 +581,6 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     }
 
     if (!err) {
-        err = pmw3610_set_performance(dev, true);
-    }
-
-    if (!err) {
         err = pmw3610_set_cpi(dev, config->cpi, config->swap_xy, config->inv_x, config->inv_y);
     }
 
@@ -517,6 +593,12 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &old);
         LOG_INF("Performance register: 0x%02x -> 0x0d", old);
         err = pmw3610_write_verified(dev, PMW3610_REG_PERFORMANCE, 0x0d);
+    }
+
+    /* Force-awake lives in the high nibble of the same register, so it has to
+       be applied after the 0x0d write above, not before it. */
+    if (!err) {
+        err = pmw3610_set_performance(dev, pmw3610_want_force_awake(dev));
     }
 	
     if (!err) {
@@ -615,18 +697,29 @@ static int pmw3610_report_data(const struct device *dev) {
 #ifdef CONFIG_PMW3610_ALT_SMART_ALGORITHM
     int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) 
                     + buf[PMW3610_SHUTTER_L_POS];
-    if (data->sw_smart_flag && shutter < 45) {
+    /* Pixart's reference code flips on a single threshold of 45.  This write
+       costs three SPI transfers and a 300 us sleep inside the frame budget,
+       and the motion interrupt is re-armed only after the work item returns,
+       so a shutter value sitting on the threshold can flip every frame and
+       cost frames outright.  A dead band around 45 removes that case; the
+       counter below says whether it was ever happening. */
+    if (data->sw_smart_flag && shutter < (45 - PMW3610_SMART_HYST)) {
         pmw3610_write(dev, 0x32, 0x00);
         data->sw_smart_flag = false;
+        data->smart_toggles++;
     }
-    if (!data->sw_smart_flag && shutter > 45) {
+    if (!data->sw_smart_flag && shutter > (45 + PMW3610_SMART_HYST)) {
         pmw3610_write(dev, 0x32, 0x80);
         data->sw_smart_flag = true;
+        data->smart_toggles++;
     }
 #endif
 
-    // purge accumulated delta, if last sampled had not been reported on last report tick
-    if (rpt_min > 0 && (now - data->last_smp_time) >= rpt_min) {
+    // purge accumulated delta once it is stale enough that emitting it would
+    // read as a jump rather than as the tail of the current stroke.  The old
+    // threshold was rpt_min itself, which also discarded the residue of any
+    // normal stroke the moment the frames spaced out past one report interval.
+    if (rpt_min > 0 && (now - data->last_smp_time) >= PMW3610_STALE_DELTA_MS) {
         data->dx = 0;
         data->dy = 0;
     }
@@ -651,11 +744,19 @@ static int pmw3610_report_data(const struct device *dev) {
         data->last_rpt_time = now;
         data->dx = 0;
         data->dy = 0;
-        if (have_x) {
-            input_report(dev, config->evt_type, config->x_input_code, rx, !have_y, K_NO_WAIT);
+        /* K_NO_WAIT: a full input queue drops the event and returns -EAGAIN.
+           The frame histogram above only measures the sensor side, so without
+           this counter a report lost between the driver and the listeners is
+           invisible.  Counted, not retried: pushing the residue back would
+           turn a small loss into a jump once the queue drains, and it is not
+           yet known whether this ever fires. */
+        if (have_x && input_report(dev, config->evt_type, config->x_input_code, rx,
+                                   !have_y, K_NO_WAIT)) {
+            data->rpt_drops++;
         }
-        if (have_y) {
-            input_report(dev, config->evt_type, config->y_input_code, ry, true, K_NO_WAIT);
+        if (have_y && input_report(dev, config->evt_type, config->y_input_code, ry,
+                                   true, K_NO_WAIT)) {
+            data->rpt_drops++;
         }
     }
 
@@ -736,9 +837,10 @@ static void pmw3610_diag_dump(struct k_work *work) {
         pmw3610_read_reg(data->dev, PMW3610_REG_PERFORMANCE, &perf);
 
         LOG_INF("diag perf=0x%02x n=%u | 4ms=%u 8ms=%u 16ms=%u slow=%u | "
-                "min=%uus sched_max=%uus work_max=%uus",
+                "min=%uus sched_max=%uus work_max=%uus | drops=%u smart=%u",
                 perf, n, b[0], b[1], b[2], b[3],
-                data->min_delta_us, data->sched_worst_us, data->work_worst_us);
+                data->min_delta_us, data->sched_worst_us, data->work_worst_us,
+                data->rpt_drops, data->smart_toggles);
 
         bool suspicious = (n >= PMW3610_WD_MIN_SAMPLES) && (b[0] == 0);
 
@@ -769,6 +871,8 @@ static void pmw3610_diag_dump(struct k_work *work) {
         data->sched_worst_us = 0;
         data->work_worst_us = 0;
         data->min_delta_us = UINT32_MAX;
+        data->rpt_drops = 0;
+        data->smart_toggles = 0;
     }
 
     k_work_reschedule_for_queue(&pmw3610_workq, &data->diag_work, PMW3610_DIAG_PERIOD);
@@ -960,21 +1064,45 @@ static const struct device *pmw3610_devs[] = {
     DT_FOREACH_STATUS_OKAY(pixart_pmw3610_alt, GET_PMW3610_DEV)
 };
 
-static int on_activity_state(const zmk_event_t *eh) {
-    struct zmk_activity_state_changed *state_ev = as_zmk_activity_state_changed(eh);
+/* Runs on the same queue as the motion work, so the SPI bus stays serialised.
+ * The ZMK listener below fires on the system workqueue, and touching
+ * PERFORMANCE from there would race the motion burst read. */
+static void pmw3610_force_awake_work_cb(struct k_work *work) {
+    ARG_UNUSED(work);
 
-    if (!state_ev) {
-        LOG_WRN("NO EVENT, leaving early");
-        return 0;
-    }
-
-    bool enable = state_ev->state == ZMK_ACTIVITY_ACTIVE ? 1 : 0;
+    /* Both the activity state and the active endpoint feed the same decision,
+       so the state is read back rather than taken from the event payload.
+       That makes this level-triggered: whatever changed while idle, the
+       correct value is applied on the next event. */
     for (size_t i = 0; i < ARRAY_SIZE(pmw3610_devs); i++) {
-        pmw3610_set_performance(pmw3610_devs[i], enable);
-    }
+        const struct device *dev = pmw3610_devs[i];
+        struct pixart_data *data = dev->data;
 
-    return 0;
+        /* An endpoint event can land while async init is still walking the
+           power-up sequence, or during a watchdog re-init. Both paths apply
+           the force themselves once configure completes. */
+        if (!data->ready) {
+            continue;
+        }
+
+        pmw3610_set_performance(dev, pmw3610_want_force_awake(dev));
+    }
 }
 
-ZMK_LISTENER(zmk_pmw3610_idle_sleeper, on_activity_state);
+static K_WORK_DEFINE(pmw3610_force_awake_work, pmw3610_force_awake_work_cb);
+
+static int on_power_profile_changed(const zmk_event_t *eh) {
+    ARG_UNUSED(eh);
+
+    if (pmw3610_workq_started) {
+        k_work_submit_to_queue(&pmw3610_workq, &pmw3610_force_awake_work);
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(zmk_pmw3610_idle_sleeper, on_power_profile_changed);
 ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_activity_state_changed);
+#if IS_ENABLED(CONFIG_ZMK_USB)
+ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_usb_conn_state_changed);
+#endif

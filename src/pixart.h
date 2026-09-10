@@ -40,6 +40,8 @@ struct pixart_data {
     uint32_t                     sched_worst_us;   // worst ISR -> callback latency
     uint32_t                     work_worst_us;    // worst callback duration
     uint32_t                     min_delta_us;     // shortest inter-frame gap in window
+    uint32_t                     rpt_drops;        // input_report() rejected by a full queue
+    uint32_t                     smart_toggles;    // smart-algorithm mode flips in window
     struct k_work_delayable      diag_work;        // periodic histogram dump
 
     /* --- frame-rate watchdog --- */
