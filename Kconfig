@@ -43,6 +43,47 @@ config PMW3610_ALT_REPORT_INTERVAL_MIN
 		Slow down input reporting for hid queue over the air.
 		Turn value down to 8ms to get sharp response if use with USB only.
 
+config PMW3610_ALT_INIT_RETRY_FAST_TRIES
+	int "Fast initialisation retries before backing off"
+	default 20
+	help
+	  A failed sensor initialisation is retried rather than given up on, so a
+	  module on pogo pins recovers by itself once contact returns. This many
+	  attempts use the short delay below before switching to the long one.
+
+	  Sized for a contact that needs seconds to settle, not milliseconds: each
+	  attempt costs roughly the delay below plus a quarter second of power-up
+	  sequence, so twenty covers about fifteen seconds. Spending them faster
+	  only means waiting out a long delay afterwards, which is what a bouncing
+	  connector feels like as a cursor that stays dead far longer than the
+	  glitch that caused it.
+
+config PMW3610_ALT_INIT_RETRY_FAST_MS
+	int "Delay between the fast initialisation retries (ms)"
+	default 500
+	help
+	  Short enough that a bouncing contact recovers without being noticed.
+
+config PMW3610_ALT_INIT_RETRY_SLOW_MS
+	int "Delay between the slow initialisation retries (ms)"
+	default 5000
+	help
+	  Used once the fast attempts are spent, and then forever. This is what a
+	  board with the trackball module removed settles into: raise it to make
+	  that case cheaper and quieter, at the cost of a slower response when the
+	  module is plugged back in.
+
+config PMW3610_ALT_UNRESOLVED_MAX
+	int "Diagnostic windows a fault may survive before a full re-init"
+	default 5
+	help
+	  How long the driver nurses a register-level fault -- waiting for a silent
+	  bus, or rewriting one register -- before re-initialising the sensor
+	  outright. Counted in diagnostic windows, so the wall-clock time depends
+	  on the diagnostic period, two seconds by default. Lower reacts sooner and
+	  costs more dead-cursor time during a bouncing contact; higher is the
+	  other way round.
+
 config PMW3610_ALT_REPORT_INTERVAL_MIN_USB
 	int "Minimum report interval while the active endpoint is USB (ms)"
 	default 0

@@ -55,6 +55,50 @@ LOG_MODULE_REGISTER(pmw3610, CONFIG_PMW3610_ALT_LOG_LEVEL);
 #define PMW3610_WD_STREAK       5
 #define PMW3610_WD_HOLDOFF_MS   60000
 
+/* PERFORMANCE holds two unrelated things: the force-awake bits in the high
+ * nibble and the run-rate fields in the low one. The run rate has been seen
+ * reverting to the power-up 0x01 at runtime, and read-modify-preserve then
+ * writes that back forever. So the wanted rate lives here and is re-asserted
+ * on every write instead of being inherited from the register. */
+#define PMW3610_PERF_FORCE_AWAKE 0xF0
+#define PMW3610_PERF_RUN_RATE_MASK 0x0F
+/* bit3 VEL, bit2 POSHI, bits1-0 POSLO -- all at 4 ms */
+#define PMW3610_PERF_RUN_RATE 0x0d
+/* A frame gap this short cannot come from a part sampling at 4 ms. It means
+ * the interrupt line is floating rather than being driven, which is what a
+ * module off its pogo pins looks like: the healthy minimum sits around
+ * 2.6 ms, a floating line rings at a few hundred microseconds. Requiring a
+ * run of them keeps a single bunched-up pair of frames from counting. */
+#define PMW3610_IMPLAUSIBLE_GAP_US 1500
+#define PMW3610_STORM_FRAMES 32
+
+/* Value PERFORMANCE holds after a power-up reset of the part. */
+#define PMW3610_PERF_POWER_UP 0x01
+/* A read of all ones means nobody is driving MISO -- the sensor is not
+ * answering at all, which on a pogo-pin module means lost contact. */
+#define PMW3610_BUS_SILENT 0xFF
+
+/* The reset detector works by spotting the power-up value in PERFORMANCE,
+ * so the rate this driver writes must never be that value. Only POSLO can
+ * go below 4 ms anyway, so there is no reason to pick anything else. */
+BUILD_ASSERT(PMW3610_PERF_RUN_RATE != PMW3610_PERF_POWER_UP,
+             "the configured run rate must differ from the power-up default, "
+             "otherwise a sensor reset cannot be told apart from a healthy part");
+
+/* Recovery policy lives in Kconfig, not here: these are the knobs someone
+ * might actually want to turn, unlike the register values above. */
+#define PMW3610_UNRESOLVED_MAX CONFIG_PMW3610_ALT_UNRESOLVED_MAX
+#define PMW3610_INIT_RETRY_FAST_TRIES CONFIG_PMW3610_ALT_INIT_RETRY_FAST_TRIES
+#define PMW3610_INIT_RETRY_FAST_MS CONFIG_PMW3610_ALT_INIT_RETRY_FAST_MS
+#define PMW3610_INIT_RETRY_SLOW_MS CONFIG_PMW3610_ALT_INIT_RETRY_SLOW_MS
+
+/* A re-init that falls apart again this soon did not fix anything. After a
+ * few of those the contact is marginal rather than momentarily lost, and
+ * repeating at full speed only produces a cursor that jumps once every
+ * couple of seconds forever. */
+#define PMW3610_RECOVERY_STICK_MS 10000
+#define PMW3610_RECOVERY_PATIENCE 2
+
 /* Accumulated but unreported delta is dropped once it is older than this.
  * Tied to perception, not to the report interval: below it the residue is the
  * tail of the stroke still in progress, above it emitting it reads as a jump. */
@@ -492,17 +536,29 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
         //   BIT 3:   VEL_RUNRATE    0x0: 8ms; 0x1 4ms;
         //   BIT 2:   POSHI_RUN_RATE 0x0: 8ms; 0x1 4ms;
         //   BIT 1-0: POSLO_RUN_RATE 0x0: 8ms; 0x1 4ms; 0x2 2ms; 0x4 Reserved
-        uint8_t perf;
-        if (config->force_awake_4ms_mode) {
-            perf = 0x0d; // RUN RATE @ 4ms
-        } else {
-            // reset bit[3..0] to 0x0 (normal operation)
-            perf = value & 0x0F; // RUN RATE @ 8ms
-        }
+        /* The run rate is asserted, not inherited: whatever the low nibble
+           currently holds is not authoritative. */
+        uint8_t perf = PMW3610_PERF_RUN_RATE;
 
         if (enabled) {
-            perf |= 0xF0; // set bit[3..0] to 0xF (force awake)
+            perf |= PMW3610_PERF_FORCE_AWAKE;
         }
+
+        if ((value & PMW3610_PERF_RUN_RATE_MASK) != PMW3610_PERF_RUN_RATE) {
+            LOG_WRN("PERFORMANCE run rate was 0x%02x, expected 0x%02x -- re-asserting",
+                    value & PMW3610_PERF_RUN_RATE_MASK, PMW3610_PERF_RUN_RATE);
+        }
+
+        if (value == PMW3610_PERF_POWER_UP) {
+            /* Reading the power-up default here means the part reset since the
+               last write. Writing our value on top would hide that from the
+               drift check, so flag it and let the diag work re-initialise --
+               calling reinit from here would recurse through async init. */
+            struct pixart_data *rd = dev->data;
+            rd->reset_suspected = true;
+            LOG_WRN("PERFORMANCE read as power-up default -- sensor reset suspected");
+        }
+
         if (perf != value) {
             /* Verified: a silently lost write here means force-awake does not
                work at all, and the read-back also proves the high nibble is
@@ -515,6 +571,9 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
             LOG_INF("%s performance mode (reg 0x%02x -> 0x%02x)",
                     enabled ? "enable" : "disable", value, perf);
         }
+
+        struct pixart_data *data = dev->data;
+        data->perf_shadow = perf;
     }
 
     return err;
@@ -573,6 +632,7 @@ static int pmw3610_async_init_check_ob1(const struct device *dev) {
 static int pmw3610_async_init_configure(const struct device *dev) {
     int err = 0;
     const struct pixart_config *config = dev->config;
+    struct pixart_data *data = dev->data;
 
     // clear motion registers first (required in datasheet)
     for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
@@ -581,7 +641,8 @@ static int pmw3610_async_init_configure(const struct device *dev) {
     }
 
     if (!err) {
-        err = pmw3610_set_cpi(dev, config->cpi, config->swap_xy, config->inv_x, config->inv_y);
+        err = pmw3610_set_cpi(dev, data->cpi_wanted ? data->cpi_wanted : config->cpi,
+                              config->swap_xy, config->inv_x, config->inv_y);
     }
 
 	/* Апстрим inorichi/zmk-pmw3610-driver пишет PERFORMANCE безусловно:
@@ -592,7 +653,12 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         uint8_t old = 0xFF;
         pmw3610_read_reg(dev, PMW3610_REG_PERFORMANCE, &old);
         LOG_INF("Performance register: 0x%02x -> 0x0d", old);
-        err = pmw3610_write_verified(dev, PMW3610_REG_PERFORMANCE, 0x0d);
+        err = pmw3610_write_verified(dev, PMW3610_REG_PERFORMANCE, PMW3610_PERF_RUN_RATE);
+        if (!err) {
+            /* Seed the shadow here too, so drift detection keeps working even
+               when the force-awake option is off and set_performance is a no-op. */
+            data->perf_shadow = PMW3610_PERF_RUN_RATE;
+        }
     }
 
     /* Force-awake lives in the high nibble of the same register, so it has to
@@ -648,16 +714,60 @@ static void pmw3610_async_init(struct k_work *work) {
     struct pixart_data *data = CONTAINER_OF(work2, struct pixart_data, init_work);
     const struct device *dev = data->dev;
 
-    LOG_INF("PMW3610 async init step %d", data->async_init_step);
+    /* Quiet on retries: with the module off this runs every few seconds
+       forever, and the first failure already said what happened. */
+    if (data->init_retries == 0) {
+        LOG_INF("PMW3610 async init step %d", data->async_init_step);
+    } else {
+        LOG_DBG("PMW3610 async init step %d (retry %u)", data->async_init_step,
+                data->init_retries);
+    }
 
     data->err = async_init_fn[data->async_init_step](dev);
     if (data->err) {
-        LOG_ERR("PMW3610 initialization failed in step %d", data->async_init_step);
+        /* Retry rather than stop. On a pogo-pin module the usual cause is a
+           contact that is still bouncing -- and a re-init triggered by that very
+           bounce would otherwise leave ready=false forever, which also silences
+           the diagnostics that would have noticed. Retrying forever costs a few
+           SPI transactions every few seconds and makes re-seating the module
+           recover on its own. */
+        int failed_step = data->async_init_step;
+        data->init_retries++;
+        data->async_init_step = 0;
+
+        uint32_t delay = data->init_retries <= PMW3610_INIT_RETRY_FAST_TRIES
+                             ? PMW3610_INIT_RETRY_FAST_MS
+                             : PMW3610_INIT_RETRY_SLOW_MS;
+
+        if (data->init_retries == 1) {
+            LOG_ERR("PMW3610 init failed in step %d -- retrying", failed_step);
+        } else {
+            LOG_DBG("PMW3610 init retry %u", data->init_retries);
+        }
+
+        k_work_schedule_for_queue(&pmw3610_workq, &data->init_work, K_MSEC(delay));
     } else {
         data->async_init_step++;
 
         if (data->async_init_step == ASYNC_INIT_STEP_COUNT) {
             data->ready = true; // sensor is ready to work
+            /* Cleared on success, not only where it is raised: a suspicion
+               re-raised during the init sequence itself would otherwise keep
+               triggering re-inits forever. */
+            data->reset_suspected = false;
+            /* Recorded, not only logged: recovery often happens while the cable
+               is being plugged in, so the messages above go to a CDC backend
+               that is not up yet. This rides along in the diag line instead and
+               says how long the part was down and how many attempts it took. */
+            data->recovery_at_s = (uint32_t)(k_uptime_get() / 1000);
+            data->recovery_retries = data->init_retries;
+            data->ready_since_ms = k_uptime_get();
+            data->discard_frame = true;
+
+            if (data->init_retries) {
+                LOG_WRN("PMW3610 initialized after %u retries", data->init_retries);
+            }
+            data->init_retries = 0;
             LOG_INF("PMW3610 initialized");
             pmw3610_set_interrupt(dev, true);
         } else {
@@ -683,6 +793,18 @@ static int pmw3610_report_data(const struct device *dev) {
 	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, PMW3610_BURST_SIZE);
     if (err) {
         return err;
+    }
+
+    if (unlikely(data->discard_frame)) {
+        /* Whatever the part accumulated while it was being reconfigured lands
+           in this first frame and reads as one jump across the screen. The
+           burst read above has already cleared it out of the sensor; throw
+           the value away rather than reporting it. */
+        data->discard_frame = false;
+        data->dx = 0;
+        data->dy = 0;
+        data->last_smp_time = now;
+        return 0;
     }
     // LOG_HEXDUMP_DBG(buf, PMW3610_BURST_SIZE, "buf");
 
@@ -776,13 +898,49 @@ static void pmw3610_gpio_callback(const struct device *gpiob, struct gpio_callba
  * stuck frame rate, and this is what a reboot does to the sensor.  The
  * interrupt is disarmed first and data->ready gates pmw3610_report_data(), so
  * motion work cannot touch the SPI bus while the sequence runs. */
-static void pmw3610_reinit(struct pixart_data *data) {
+static void pmw3610_reinit(struct pixart_data *data, uint32_t delay_ms) {
     pmw3610_set_interrupt(data->dev, false);
     data->ready = false;
     data->async_init_step = 0;
+    data->init_retries = 0;
+    /* One place for all of it: a re-init is the response to a fault, so it
+       hands back a fresh retry budget and a fresh escalation budget. The
+       incident flag is deliberately NOT cleared -- the fault only counts as
+       over when a check actually passes, otherwise a re-init that does not
+       help would book a new incident every couple of seconds. */
+    data->unresolved = 0;
+    data->reset_suspected = false;
+    data->storm_detected = false;
+    data->fast_frames = 0;
     data->last_reinit_ms = k_uptime_get();
     k_work_schedule_for_queue(&pmw3610_workq, &data->init_work,
-                              K_MSEC(async_init_delay[0]));
+                              K_MSEC(delay_ms + async_init_delay[0]));
+}
+
+/* The re-init entry point for faults found by the diagnostics: it notices a
+ * recovery that did not hold and slows the next attempt down. The delay is
+ * dead time, not garbage time -- pmw3610_reinit() disarms the interrupt
+ * before it, so nothing reaches the host while the part is left alone. */
+static void pmw3610_redo(struct pixart_data *data) {
+    const bool stuck = data->ready_since_ms != 0 &&
+                       (k_uptime_get() - data->ready_since_ms) <
+                           PMW3610_RECOVERY_STICK_MS;
+
+    if (stuck) {
+        data->failed_recoveries++;
+    } else {
+        data->failed_recoveries = 0;
+    }
+
+    uint32_t delay = 0;
+
+    if (data->failed_recoveries > PMW3610_RECOVERY_PATIENCE) {
+        delay = PMW3610_INIT_RETRY_SLOW_MS;
+        LOG_WRN("recovery has not held %u times -- backing off %u ms",
+                data->failed_recoveries, delay);
+    }
+
+    pmw3610_reinit(data, delay);
 }
 
 static void pmw3610_work_callback(struct k_work *work) {
@@ -794,8 +952,32 @@ static void pmw3610_work_callback(struct k_work *work) {
     uint32_t sched_us = PMW3610_CYC_TO_US(t0 - data->irq_ticks);
     data->prev_cb = t0;
 
-    pmw3610_report_data(dev);
-    pmw3610_set_interrupt(dev, true);
+    /* A disconnected module leaves the interrupt line floating, and the driver
+       would happily service thousands of phantom frames a second, flooding the
+       input queue with garbage. Stop at the first run of impossible gaps and
+       leave the interrupt disarmed until a re-init puts the part back. */
+    if (delta_us < PMW3610_IMPLAUSIBLE_GAP_US) {
+        data->fast_frames++;
+    } else {
+        data->fast_frames = 0;
+    }
+
+    if (data->fast_frames >= PMW3610_STORM_FRAMES && !data->storm_detected) {
+        data->storm_detected = true;
+        LOG_WRN("interrupt storm: %u frames under %u us -- line is floating",
+                data->fast_frames, PMW3610_IMPLAUSIBLE_GAP_US);
+    }
+
+    if (!data->storm_detected) {
+        pmw3610_report_data(dev);
+    }
+
+    /* Not unconditional: a re-init disarms the interrupt on purpose, and a
+       trigger already sitting in the queue would otherwise put it straight
+       back and rain interrupts through the reconfiguration. */
+    if (data->ready && !data->storm_detected) {
+        pmw3610_set_interrupt(dev, true);
+    }
 
     uint32_t work_us = PMW3610_CYC_TO_US(k_cycle_get_32() - t0);
 
@@ -832,15 +1014,111 @@ static void pmw3610_diag_dump(struct k_work *work) {
     uint32_t *b = data->delta_buckets;
     uint32_t n = b[0] + b[1] + b[2] + b[3];
 
-    if (n > 0 && data->ready) {
-        uint8_t perf = 0xFF;
+    const bool ready = data->ready;
+    uint8_t perf = PMW3610_BUS_SILENT;
+
+    /* Deliberately not gated on n. A part that reset into a state where it
+       reports no motion at all would otherwise never be looked at again --
+       no motion means no window, no window means no check, and the trackball
+       stays silently dead until a reboot. Two register reads every couple of
+       seconds cost nothing next to that. */
+    if (ready) {
         pmw3610_read_reg(data->dev, PMW3610_REG_PERFORMANCE, &perf);
 
+        const bool silent = perf == PMW3610_BUS_SILENT;
+        const bool perf_lost = data->perf_shadow != 0 && perf != data->perf_shadow;
+
+        /* One shadow, three outcomes. All ones means the part is not driving the
+           bus at all. The power-up value means a glitch reset it, and PERFORMANCE
+           is then the least of it -- CPI, every downshift time and every sample
+           time are back at their defaults too, so only a full re-init fixes it.
+           Anything else is a stray write and one register is enough to put back.
+
+           CPI is deliberately not watched alongside: RES_STEP lives behind a
+           0x7f bank switch, so a plain read of it always returns 0xff, and doing
+           the bank switch here every two seconds would risk leaving the part in
+           the wrong bank if it were interrupted on a flaky contact. PERFORMANCE
+           catches the reset on its own. */
+        const bool fault = perf_lost || data->reset_suspected || data->storm_detected;
+
+        if (!fault) {
+            data->fault_active = false;
+            data->unresolved = 0;
+        }
+
+        if (fault) {
+            /* Counted and logged on the rising edge only. The check now runs in
+               every window, motion or not, so a module lying on the desk would
+               otherwise add to the counter and to the log every two seconds and
+               turn a count of incidents into a count of windows. */
+            const bool first = !data->fault_active;
+
+            data->fault_active = true;
+            data->unresolved++;
+
+            if (first) {
+                /* One coherent snapshot per incident. Kept rather than only
+                   logged, because a fault raised while the cable is out reaches
+                   a dead CDC backend; these fields ride along in the diag line
+                   instead and survive until the next reconnect. */
+                data->perf_drift++;
+                data->drift_was = data->perf_shadow;
+                data->drift_found = perf;
+                data->drift_at_s = (uint32_t)(k_uptime_get() / 1000);
+            }
+            if (data->unresolved > PMW3610_UNRESOLVED_MAX) {
+                /* Whatever it was, nursing it has not worked: either the part
+                   still is not answering, or the one-register repair keeps
+                   failing. Re-init retries on its own and recovers once the
+                   module is back, which beats spinning here forever. */
+                LOG_WRN("fault unresolved for %u windows -- re-initialising",
+                        data->unresolved);
+                pmw3610_redo(data);
+            } else if (silent || data->storm_detected) {
+                /* Nothing is driving the bus, or the interrupt line is ringing.
+                   Waiting this out was a mistake: a part that does not answer
+                   will not start answering on its own, and every window spent
+                   waiting is a window with a floating line still armed. */
+                LOG_WRN("sensor not answering (drift #%u) -- re-initialising",
+                        data->perf_drift);
+                pmw3610_redo(data);
+            } else if (perf == PMW3610_PERF_POWER_UP || data->reset_suspected) {
+                /* The power-up default means the part reset, and PERFORMANCE is
+                   then the least of it: CPI, every downshift time and every REST
+                   sample time are back at their defaults too. Repairing this one
+                   register would leave the rest silently wrong while the log went
+                   back to looking healthy. */
+                LOG_WRN("sensor reset detected (0x%02x -> 0x%02x, drift #%u) "
+                        "-- re-initialising",
+                        data->perf_shadow, perf, data->perf_drift);
+                pmw3610_redo(data);
+            } else {
+                if (first) {
+                    LOG_WRN("PERFORMANCE drifted: 0x%02x -> 0x%02x (drift #%u) "
+                            "-- repairing",
+                            data->perf_shadow, perf, data->perf_drift);
+                }
+                if (pmw3610_write_verified(data->dev, PMW3610_REG_PERFORMANCE,
+                                           data->perf_shadow) == 0) {
+                    perf = data->perf_shadow;
+                }
+            }
+        }
+    }
+
+    if (n > 0 && ready) {
         LOG_INF("diag perf=0x%02x n=%u | 4ms=%u 8ms=%u 16ms=%u slow=%u | "
-                "min=%uus sched_max=%uus work_max=%uus | drops=%u smart=%u",
+                "min=%uus sched_max=%uus work_max=%uus | drops=%u smart=%u drift=%u",
                 perf, n, b[0], b[1], b[2], b[3],
                 data->min_delta_us, data->sched_worst_us, data->work_worst_us,
-                data->rpt_drops, data->smart_toggles);
+                data->rpt_drops, data->smart_toggles, data->perf_drift);
+
+        if (data->perf_drift) {
+            LOG_INF("  last drift @%us: 0x%02x -> 0x%02x | recovered @%us "
+                    "after %u retries",
+                    data->drift_at_s, data->drift_was, data->drift_found,
+                    data->recovery_at_s, data->recovery_retries);
+        }
 
         bool suspicious = (n >= PMW3610_WD_MIN_SAMPLES) && (b[0] == 0);
 
@@ -863,7 +1141,7 @@ static void pmw3610_diag_dump(struct k_work *work) {
 
             data->stuck_streak = 0;
             if (armed && cooled) {
-                pmw3610_reinit(data);
+                pmw3610_reinit(data, 0);
             }
         }
 
@@ -963,24 +1241,20 @@ static int pmw3610_init(const struct device *dev) {
     return err;
 }
 
-static int pmw3610_alt_attr_set(const struct device *dev, enum sensor_channel chan,
-                            enum sensor_attribute attr, const struct sensor_value *val) {
+/* Runs on pmw3610_workq only -- see the wrapper below. */
+static int pmw3610_attr_apply(const struct device *dev, enum sensor_attribute attr,
+                              const struct sensor_value *val) {
     struct pixart_data *data = dev->data;
     const struct pixart_config *config = dev->config;
     int err;
 
-    if (unlikely(chan != SENSOR_CHAN_ALL)) {
-        return -ENOTSUP;
-    }
-
-    if (unlikely(!data->ready)) {
-        LOG_DBG("Device is not initialized yet");
-        return -EBUSY;
-    }
-
     switch ((uint32_t)attr) {
     case PMW3610_ALT_ATTR_CPI:
-        err = pmw3610_set_cpi(dev, PMW3610_SVALUE_TO_CPI(*val),
+        /* Remembered, not just written: a re-init re-runs the whole
+           configuration, and taking the devicetree value there would silently
+           undo a runtime setting the next time the sensor is recovered. */
+        data->cpi_wanted = PMW3610_SVALUE_TO_CPI(*val);
+        err = pmw3610_set_cpi(dev, data->cpi_wanted,
                               config->swap_xy, config->inv_x, config->inv_y);
         break;
 
@@ -1014,6 +1288,74 @@ static int pmw3610_alt_attr_set(const struct device *dev, enum sensor_channel ch
     }
 
     return err;
+}
+
+/* Every attribute write touches SPI, and every other SPI access in this driver
+ * goes through pmw3610_workq. A caller from a keymap behaviour or an input
+ * processor would otherwise drive the bus underneath the motion read, and the
+ * diagnostics could sample a register mid-change and mistake it for drift --
+ * which now escalates to a re-init. So the request is handed to that queue and
+ * waited on, which also keeps the synchronous return code the API promises. */
+struct pmw3610_attr_req {
+    struct k_work work;
+    struct k_sem done;
+    const struct device *dev;
+    enum sensor_attribute attr;
+    struct sensor_value val;
+    int err;
+};
+
+static void pmw3610_attr_work(struct k_work *work) {
+    struct pmw3610_attr_req *req = CONTAINER_OF(work, struct pmw3610_attr_req, work);
+
+    req->err = pmw3610_attr_apply(req->dev, req->attr, &req->val);
+    k_sem_give(&req->done);
+}
+
+static int pmw3610_alt_attr_set(const struct device *dev, enum sensor_channel chan,
+                                enum sensor_attribute attr, const struct sensor_value *val) {
+    struct pixart_data *data = dev->data;
+
+    if (unlikely(chan != SENSOR_CHAN_ALL)) {
+        return -ENOTSUP;
+    }
+
+    if (unlikely(!data->ready)) {
+        LOG_DBG("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    if (k_is_in_isr()) {
+        /* The wait below is not legal in interrupt context, and no caller has a
+           reason to set an attribute from there. */
+        return -EWOULDBLOCK;
+    }
+
+    /* Already on the right thread: going through the queue from here would
+       wait for a work item that cannot run until we return. */
+    if (k_current_get() == &pmw3610_workq.thread) {
+        return pmw3610_attr_apply(dev, attr, val);
+    }
+
+    struct pmw3610_attr_req req = {
+        .dev = dev,
+        .attr = attr,
+        .val = *val,
+        .err = 0,
+    };
+
+    k_work_init(&req.work, pmw3610_attr_work);
+    k_sem_init(&req.done, 0, 1);
+    k_work_submit_to_queue(&pmw3610_workq, &req.work);
+
+    /* req lives on this stack, so this wait cannot be given a timeout: returning
+       early would leave the queue holding a work item that points at a frame
+       which no longer exists. The queue is cooperative and its longest item is
+       a verified register write, tens of milliseconds, so there is nothing to
+       time out against anyway. */
+    k_sem_take(&req.done, K_FOREVER);
+
+    return req.err;
 }
 
 static const struct sensor_driver_api pmw3610_driver_api = {
