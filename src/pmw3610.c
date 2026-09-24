@@ -107,6 +107,29 @@ BUILD_ASSERT(PMW3610_PERF_RUN_RATE != PMW3610_PERF_POWER_UP,
 /* Dead band around the smart-algorithm shutter threshold of 45. */
 #define PMW3610_SMART_HYST 5
 
+/* Quiet diagnostics. A healthy window gets a line only once per heartbeat;
+ * these decide which windows are unusual enough to always get one. */
+#define PMW3610_DIAG_HEARTBEAT_MS ((int64_t)CONFIG_PMW3610_ALT_DIAG_HEARTBEAT_S * 1000)
+/* One or two flips follow every (re)connect while the flag settles; more
+ * than this in one window means the shutter sits on the threshold or the
+ * contact is flaky. */
+#define PMW3610_DIAG_SMART_NOISY 4
+/* An interrupt left waiting this long is felt as a frozen cursor; flash
+ * writes while a BLE connection comes up produce around 35 ms. */
+#define PMW3610_DIAG_STALL_US 10000
+
+/* The first failure of an init attempt says why. The same reason repeated
+ * on every retry -- every few seconds, forever, with the module unplugged --
+ * only buries the rest of the log, so the repeats drop to DBG. */
+#define PMW3610_INIT_ERR(data, ...)                                             \
+    do {                                                                        \
+        if ((data)->init_retries == 0) {                                        \
+            LOG_ERR(__VA_ARGS__);                                               \
+        } else {                                                                \
+            LOG_DBG(__VA_ARGS__);                                               \
+        }                                                                       \
+    } while (0)
+
 /* k_cyc_to_us_near32() overflows a few milliseconds in at 32768 Hz - go 64-bit. */
 #define PMW3610_CYC_TO_US(c) ((uint32_t)k_cyc_to_us_near64((uint64_t)(uint32_t)(c)))
 
@@ -602,27 +625,29 @@ static int pmw3610_async_init_clear_ob1(const struct device *dev) {
 }
 
 static int pmw3610_async_init_check_ob1(const struct device *dev) {
+    struct pixart_data *data = dev->data;
     uint8_t value;
     int err = pmw3610_read_reg(dev, PMW3610_REG_OBSERVATION, &value);
     if (err) {
-        LOG_ERR("Can't do self-test");
+        PMW3610_INIT_ERR(data, "Can't do self-test");
         return err;
     }
 
     if ((value & 0x0F) != 0x0F) {
-        LOG_ERR("Failed self-test (0x%x)", value);
+        PMW3610_INIT_ERR(data, "Failed self-test (0x%x)", value);
         return -EINVAL;
     }
 
     uint8_t product_id = 0x01;
     err = pmw3610_read_reg(dev, PMW3610_REG_PRODUCT_ID, &product_id);
     if (err) {
-        LOG_ERR("Cannot obtain product id");
+        PMW3610_INIT_ERR(data, "Cannot obtain product id");
         return err;
     }
 
     if (product_id != PMW3610_PRODUCT_ID) {
-        LOG_ERR("Incorrect product id 0x%x (expecting 0x%x)!", product_id, PMW3610_PRODUCT_ID);
+        PMW3610_INIT_ERR(data, "Incorrect product id 0x%x (expecting 0x%x)!", product_id,
+                         PMW3610_PRODUCT_ID);
         return -EIO;
     }
 
@@ -763,6 +788,9 @@ static void pmw3610_async_init(struct k_work *work) {
             data->recovery_retries = data->init_retries;
             data->ready_since_ms = k_uptime_get();
             data->discard_frame = true;
+            /* One line right after every (re)init, whatever the heartbeat:
+               it is the confirmation that the part came back at 4 ms. */
+            data->diag_force = true;
 
             if (data->init_retries) {
                 LOG_WRN("PMW3610 initialized after %u retries", data->init_retries);
@@ -1107,17 +1135,37 @@ static void pmw3610_diag_dump(struct k_work *work) {
     }
 
     if (n > 0 && ready) {
-        LOG_INF("diag perf=0x%02x n=%u | 4ms=%u 8ms=%u 16ms=%u slow=%u | "
-                "min=%uus sched_max=%uus work_max=%uus | drops=%u smart=%u drift=%u",
-                perf, n, b[0], b[1], b[2], b[3],
-                data->min_delta_us, data->sched_worst_us, data->work_worst_us,
-                data->rpt_drops, data->smart_toggles, data->perf_drift);
+        /* Quiet by default. A line for every window was the tool for chasing
+           the 8 ms problem; now that faults are caught and repaired on their
+           own it only buries the rest of the log. Printed: anything unusual,
+           the first window after a (re)init, and otherwise one heartbeat.
+           Only the printing is gated -- the counters, the watchdog and the
+           window reset below run exactly as before. */
+        const int64_t now_ms = k_uptime_get();
+        const bool unusual = data->rpt_drops > 0 ||
+                             (n >= PMW3610_WD_MIN_SAMPLES && (b[1] + b[2]) > b[0]) ||
+                             data->smart_toggles > PMW3610_DIAG_SMART_NOISY ||
+                             data->sched_worst_us > PMW3610_DIAG_STALL_US ||
+                             data->fault_active;
+        const bool heartbeat = PMW3610_DIAG_HEARTBEAT_MS == 0 ||
+                               now_ms - data->diag_printed_ms >= PMW3610_DIAG_HEARTBEAT_MS;
 
-        if (data->perf_drift) {
-            LOG_INF("  last drift @%us: 0x%02x -> 0x%02x | recovered @%us "
-                    "after %u retries",
-                    data->drift_at_s, data->drift_was, data->drift_found,
-                    data->recovery_at_s, data->recovery_retries);
+        if (unusual || heartbeat || data->diag_force) {
+            data->diag_printed_ms = now_ms;
+            data->diag_force = false;
+
+            LOG_INF("diag perf=0x%02x n=%u | 4ms=%u 8ms=%u 16ms=%u slow=%u | "
+                    "min=%uus sched_max=%uus work_max=%uus | drops=%u smart=%u drift=%u",
+                    perf, n, b[0], b[1], b[2], b[3],
+                    data->min_delta_us, data->sched_worst_us, data->work_worst_us,
+                    data->rpt_drops, data->smart_toggles, data->perf_drift);
+
+            if (data->perf_drift) {
+                LOG_INF("  last drift @%us: 0x%02x -> 0x%02x | recovered @%us "
+                        "after %u retries",
+                        data->drift_at_s, data->drift_was, data->drift_found,
+                        data->recovery_at_s, data->recovery_retries);
+            }
         }
 
         bool suspicious = (n >= PMW3610_WD_MIN_SAMPLES) && (b[0] == 0);

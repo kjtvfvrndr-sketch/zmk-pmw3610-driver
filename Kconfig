@@ -84,6 +84,21 @@ config PMW3610_ALT_UNRESOLVED_MAX
 	  costs more dead-cursor time during a bouncing contact; higher is the
 	  other way round.
 
+config PMW3610_ALT_DIAG_HEARTBEAT_S
+	int "Seconds between routine diagnostic lines while nothing is wrong"
+	default 60
+	range 0 3600
+	help
+	  The diagnostic line is always printed for a window that shows
+	  something unusual -- lost reports, late frames, a noisy smart
+	  algorithm, a scheduling stall or a register fault -- and for the
+	  first window after every (re)initialisation. A healthy window is
+	  printed only once per this many seconds. The last-incident snapshot
+	  rides along with every printed line, so an incident that happened
+	  while the cable was out still shows up within this time of plugging
+	  back in and moving the ball. 0 prints every window, the verbose
+	  behaviour.
+
 config PMW3610_ALT_REPORT_INTERVAL_MIN_USB
 	int "Minimum report interval while the active endpoint is USB (ms)"
 	default 0

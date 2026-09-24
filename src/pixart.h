@@ -59,6 +59,8 @@ struct pixart_data {
     bool                         fault_active;     // a fault was already reported, do not recount
     uint32_t                     unresolved;       // consecutive windows the fault survived
     uint32_t                     cpi_wanted;       // CPI set at runtime; 0 = use the devicetree value
+    int64_t                      diag_printed_ms;  // uptime of the last diag line printed
+    bool                         diag_force;       // print the next window whatever it shows
     struct k_work_delayable      diag_work;        // periodic histogram dump
 
     /* --- frame-rate watchdog --- */
