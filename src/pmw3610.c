@@ -20,6 +20,10 @@
 #include <zmk/usb.h>
 #include <zmk/events/usb_conn_state_changed.h>
 #endif
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+#include <zmk/ble.h>
+#include <zmk/events/ble_active_profile_changed.h>
+#endif
 #if IS_ENABLED(CONFIG_BT)
 #include <zephyr/bluetooth/conn.h>
 #endif
@@ -106,6 +110,30 @@ BUILD_ASSERT(PMW3610_PERF_RUN_RATE != PMW3610_PERF_POWER_UP,
 
 /* Dead band around the smart-algorithm shutter threshold of 45. */
 #define PMW3610_SMART_HYST 5
+
+/* The part reports motion the ball never made for a moment after its
+ * registers are written: a few frames right after every (re)init, and after
+ * the force-awake switch in PERFORMANCE; and around USB power arriving or
+ * going. Each one is a cursor jump, and an auto-mouse layer takes it for the
+ * ball being used. */
+#define PMW3610_DISCARD_MOTION_AFTER_RECONFIGURE_MS                                            \
+    CONFIG_PMW3610_ALT_DISCARD_MOTION_AFTER_RECONFIGURE_MS
+
+/* Opens (or extends) the window in which motion is read and thrown away. */
+static void pmw3610_discard_motion_for_a_while(struct pixart_data *data, const char *reason) {
+    data->motion_discard_until_ms = k_uptime_get() + PMW3610_DISCARD_MOTION_AFTER_RECONFIGURE_MS;
+    data->motion_discard_reason = reason;
+}
+
+/* The same, but not under a hand that is moving the ball: the force-awake
+ * devicetree property switches on with the activity state, which the ball
+ * itself turns ACTIVE, and the window would swallow the start of that stroke.
+ * A frame within the last PMW3610_STALE_DELTA_MS says the ball is in use. */
+static void pmw3610_discard_motion_unless_moving(struct pixart_data *data, const char *reason) {
+    if (k_uptime_get() - data->last_smp_time > PMW3610_STALE_DELTA_MS) {
+        pmw3610_discard_motion_for_a_while(data, reason);
+    }
+}
 
 /* Quiet diagnostics. A healthy window gets a line only once per heartbeat;
  * these decide which windows are unusual enough to always get one. */
@@ -218,7 +246,24 @@ ZMK_SUBSCRIPTION(pmw3610_endpoint, zmk_endpoint_changed);
 // On battery, letting the sensor downshift into REST1 is the  //
 // whole point of the downshift timing. On USB there is no     //
 // power to save, so the sensor is pinned in RUN and the        //
-// wake-up lag on the first motion after a pause disappears.    //
+// wake-up lag on the first motion after a pause disappears --  //
+// as long as some host is there to take the motion.            //
+
+#if IS_ENABLED(CONFIG_PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER) && IS_ENABLED(CONFIG_ZMK_USB)
+/* A computer on the cable, or a Bluetooth host on the active profile. USB
+   counts once a computer has configured the board, and keeps counting while
+   that computer sleeps; a charger or a power bank never configures it. */
+static bool pmw3610_host_present(void) {
+    if (zmk_usb_is_hid_ready()) {
+        return true;
+    }
+#if IS_ENABLED(CONFIG_ZMK_BLE)
+    return zmk_ble_active_profile_is_connected();
+#else
+    return false;
+#endif
+}
+#endif
 
 static bool pmw3610_want_force_awake(const struct device *dev) {
     const struct pixart_config *config = dev->config;
@@ -230,13 +275,22 @@ static bool pmw3610_want_force_awake(const struct device *dev) {
     }
 
 #if IS_ENABLED(CONFIG_PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER) && IS_ENABLED(CONFIG_ZMK_USB)
-    /* Cable presence, not the selected endpoint: what makes REST pointless is
+    /* Cable power, not the selected endpoint: what makes REST pointless is
        mains power, and that is there whichever output happens to be active.
        Not gated on the activity state either -- idle saves nothing on mains,
        while releasing the force on idle would put the lag back on the first
-       stroke after every return. It cannot carry into deep sleep regardless:
-       is_usb_power_present() blocks ZMK_ACTIVITY_SLEEP while the cable is in. */
-    return zmk_usb_is_powered();
+       stroke after every return.
+
+       But only with a host to take the motion. On a charger, a power bank or
+       the port of a computer that is switched off, RUN buys nothing, and the
+       board may well go to deep sleep there: ZMK's own sleep never does on
+       USB power, but a module that puts a hostless keyboard to sleep early
+       does. The sensor keeps its PERFORMANCE register through System OFF, so
+       a force left in place would hold it in RUN -- 0.6 mA against 7 uA in
+       REST3 -- and would go on drawing that from the battery once the cable
+       is out, until the next wake-up. With no host the force is released
+       before any such sleep can start. */
+    return zmk_usb_is_powered() && pmw3610_host_present();
 #else
     return false;
 #endif
@@ -591,6 +645,8 @@ static int pmw3610_set_performance(const struct device *dev, bool enabled) {
                 LOG_ERR("Can't write performance register %d", err);
                 return err;
             }
+            pmw3610_discard_motion_unless_moving(dev->data, enabled ? "performance mode on"
+                                                                    : "performance mode off");
             LOG_INF("%s performance mode (reg 0x%02x -> 0x%02x)",
                     enabled ? "enable" : "disable", value, perf);
         }
@@ -787,7 +843,9 @@ static void pmw3610_async_init(struct k_work *work) {
             data->recovery_at_s = (uint32_t)(k_uptime_get() / 1000);
             data->recovery_retries = data->init_retries;
             data->ready_since_ms = k_uptime_get();
-            data->discard_frame = true;
+            /* Whatever the part accumulated while it was being configured,
+               and what it reports while it settles, is not the ball. */
+            pmw3610_discard_motion_for_a_while(data, "init");
             /* One line right after every (re)init, whatever the heartbeat:
                it is the confirmation that the part came back at 4 ms. */
             data->diag_force = true;
@@ -823,17 +881,6 @@ static int pmw3610_report_data(const struct device *dev) {
         return err;
     }
 
-    if (unlikely(data->discard_frame)) {
-        /* Whatever the part accumulated while it was being reconfigured lands
-           in this first frame and reads as one jump across the screen. The
-           burst read above has already cleared it out of the sensor; throw
-           the value away rather than reporting it. */
-        data->discard_frame = false;
-        data->dx = 0;
-        data->dy = 0;
-        data->last_smp_time = now;
-        return 0;
-    }
     // LOG_HEXDUMP_DBG(buf, PMW3610_BURST_SIZE, "buf");
 
 // 12-bit two's complement value to int16_t
@@ -843,6 +890,19 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t x = TOINT16((buf[PMW3610_X_L_POS] + ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12);
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
+
+    if (unlikely(now < data->motion_discard_until_ms)) {
+        /* The part settling after a register write of ours. The burst read
+           above has cleared it out of the sensor; counted for the log line
+           the diagnostics print once the window is over, and thrown away. */
+        data->motion_discarded_frames++;
+        data->motion_discarded_dx += x;
+        data->motion_discarded_dy += y;
+        data->dx = 0;
+        data->dy = 0;
+        data->last_smp_time = now;
+        return 0;
+    }
 
 #ifdef CONFIG_PMW3610_ALT_SMART_ALGORITHM
     int16_t shutter = ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) 
@@ -1129,9 +1189,19 @@ static void pmw3610_diag_dump(struct k_work *work) {
                 if (pmw3610_write_verified(data->dev, PMW3610_REG_PERFORMANCE,
                                            data->perf_shadow) == 0) {
                     perf = data->perf_shadow;
+                    pmw3610_discard_motion_unless_moving(data, "performance repair");
                 }
             }
         }
+    }
+
+    if (data->motion_discarded_frames > 0 && k_uptime_get() >= data->motion_discard_until_ms) {
+        LOG_INF("motion discarded after %s: %u frames, dx %d dy %d",
+                data->motion_discard_reason, data->motion_discarded_frames,
+                data->motion_discarded_dx, data->motion_discarded_dy);
+        data->motion_discarded_frames = 0;
+        data->motion_discarded_dx = 0;
+        data->motion_discarded_dy = 0;
     }
 
     if (n > 0 && ready) {
@@ -1457,8 +1527,15 @@ static const struct device *pmw3610_devs[] = {
 /* Runs on the same queue as the motion work, so the SPI bus stays serialised.
  * The ZMK listener below fires on the system workqueue, and touching
  * PERFORMANCE from there would race the motion burst read. */
+/* Set by the USB event, taken by the work below: power arriving or going on
+ * the cable is the other moment the part has been seen to report motion the
+ * ball never made. */
+static atomic_t usb_power_changed;
+
 static void pmw3610_force_awake_work_cb(struct k_work *work) {
     ARG_UNUSED(work);
+
+    const bool after_usb_power_change = atomic_set(&usb_power_changed, 0);
 
     /* Both the activity state and the active endpoint feed the same decision,
        so the state is read back rather than taken from the event payload.
@@ -1475,6 +1552,9 @@ static void pmw3610_force_awake_work_cb(struct k_work *work) {
             continue;
         }
 
+        if (after_usb_power_change) {
+            pmw3610_discard_motion_unless_moving(data, "USB power change");
+        }
         pmw3610_set_performance(dev, pmw3610_want_force_awake(dev));
     }
 }
@@ -1482,7 +1562,11 @@ static void pmw3610_force_awake_work_cb(struct k_work *work) {
 static K_WORK_DEFINE(pmw3610_force_awake_work, pmw3610_force_awake_work_cb);
 
 static int on_power_profile_changed(const zmk_event_t *eh) {
-    ARG_UNUSED(eh);
+#if IS_ENABLED(CONFIG_ZMK_USB)
+    if (as_zmk_usb_conn_state_changed(eh) != NULL) {
+        atomic_set(&usb_power_changed, 1);
+    }
+#endif
 
     if (pmw3610_workq_started) {
         k_work_submit_to_queue(&pmw3610_workq, &pmw3610_force_awake_work);
@@ -1495,4 +1579,11 @@ ZMK_LISTENER(zmk_pmw3610_idle_sleeper, on_power_profile_changed);
 ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_activity_state_changed);
 #if IS_ENABLED(CONFIG_ZMK_USB)
 ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_usb_conn_state_changed);
+#endif
+#if IS_ENABLED(CONFIG_PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER) && IS_ENABLED(CONFIG_ZMK_USB) &&      \
+    IS_ENABLED(CONFIG_ZMK_BLE)
+/* A Bluetooth host coming or going changes whether anyone takes the motion.
+   ZMK raises this on profile selection and on the active profile's connect
+   and disconnect alike. */
+ZMK_SUBSCRIPTION(zmk_pmw3610_idle_sleeper, zmk_ble_active_profile_changed);
 #endif

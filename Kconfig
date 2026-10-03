@@ -35,6 +35,26 @@ config PMW3610_ALT_INIT_POWER_UP_EXTRA_DELAY_MS
     Default minimum init power up delay is 10ms.
     Use this config to postpone init power up sequence if needs longer bootup time.
 
+config PMW3610_ALT_DISCARD_MOTION_AFTER_RECONFIGURE_MS
+  int "Motion thrown away after the driver writes the sensor's registers (ms)"
+  range 0 1000
+  default 100
+  help
+    For a moment after its registers are written the sensor reports motion
+    the ball never made: a few frames right after every (re)initialisation,
+    after the force-awake switch in PERFORMANCE -- on USB power with a host,
+    with the activity state, and when a drifted value is repaired -- and when
+    USB power arrives or goes.
+    Each frame is a cursor jump, and an auto-mouse layer takes it for the
+    ball being used.
+
+    Frames in this window are read, which clears them out of the sensor, and
+    thrown away. After a (re)initialisation always; after a PERFORMANCE
+    write or a change of USB power only while the ball is at rest, so the
+    start of a stroke that itself switched force-awake on is kept. Once it is over the log says
+    what was thrown away: "motion discarded after init: 3 frames, dx 4
+    dy -1". 0 keeps every frame.
+
 config PMW3610_ALT_REPORT_INTERVAL_MIN
 	int "PMW3610's default minimum report rate"
 	default 0
@@ -107,7 +127,7 @@ config PMW3610_ALT_REPORT_INTERVAL_MIN_USB
 	  0 disables throttling and yields the full sensor frame rate.
 
 config PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER
-	bool "Keep the sensor in RUN mode while the board is on USB power"
+	bool "Keep the sensor in RUN mode while the board is on USB power with a host"
 	default n
 	help
 	  With the cable in there is no battery to save, so the sensor is pinned
@@ -117,6 +137,17 @@ config PMW3610_ALT_FORCE_AWAKE_ON_USB_POWER
 	  Battery operation is unaffected -- the RUN downshift timing applies as
 	  soon as the cable is out. The idle activity state does not release the
 	  force either, since idle saves nothing while on mains power.
+
+	  A host has to be there to take the motion: a computer that configured
+	  the board over USB (it stays counted while that computer sleeps), or
+	  a Bluetooth host connected on the active profile. On a charger, a
+	  power bank or the port of a computer that is off, the sensor keeps its
+	  normal downshift. Nothing uses the motion there, and a keyboard that
+	  goes to deep sleep in that state -- an early-sleep module can put a
+	  hostless one to sleep even on USB power -- must not carry the force
+	  into System OFF, where the sensor would stay in RUN (0.6 mA against
+	  7 uA in REST3) and keep drawing it from the battery once the cable is
+	  out.
 
 	  To force the sensor awake on battery as well, use the force-awake
 	  devicetree property on the sensor node instead.

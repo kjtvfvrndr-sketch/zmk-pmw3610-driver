@@ -53,7 +53,12 @@ struct pixart_data {
     bool                         storm_detected;   // irq line is ringing, not reporting motion
     int64_t                      ready_since_ms;   // uptime when init last completed
     uint32_t                     failed_recoveries;// re-inits that fell apart again
-    bool                         discard_frame;    // drop the first motion frame after init
+    int64_t                      motion_discard_until_ms; // motion before this is the part settling
+                                                          // after a register write of ours, not the ball
+    const char                  *motion_discard_reason;   // what opened that window, for the log
+    uint32_t                     motion_discarded_frames; // frames thrown away in it
+    int32_t                      motion_discarded_dx;     // what they would have moved
+    int32_t                      motion_discarded_dy;
     bool                         reset_suspected;  // a read returned the power-up default
     uint32_t                     init_retries;     // consecutive failed init attempts
     bool                         fault_active;     // a fault was already reported, do not recount
