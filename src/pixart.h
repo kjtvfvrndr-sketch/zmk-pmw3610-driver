@@ -20,8 +20,8 @@ struct pixart_data {
     const struct device          *dev;
     int64_t                      dx;
     int64_t                      dy;
-    int64_t                      last_smp_time;
-    int64_t                      last_rpt_time;
+    int64_t                      last_smp_time; // k_uptime_ticks() of the previous frame
+    int64_t                      last_rpt_time; // k_uptime_ticks() of the previous report
     bool                         sw_smart_flag; // for pmw3610 smart algorithm
 
     struct gpio_callback         irq_gpio_cb; // motion pin irq callback
@@ -53,7 +53,7 @@ struct pixart_data {
     bool                         storm_detected;   // irq line is ringing, not reporting motion
     int64_t                      ready_since_ms;   // uptime when init last completed
     uint32_t                     failed_recoveries;// re-inits that fell apart again
-    int64_t                      motion_discard_until_ms; // motion before this is the part settling
+    int64_t                      motion_discard_until_ticks; // k_uptime_ticks(): motion before this is the part settling
                                                           // after a register write of ours, not the ball
     const char                  *motion_discard_reason;   // what opened that window, for the log
     uint32_t                     motion_discarded_frames; // frames thrown away in it

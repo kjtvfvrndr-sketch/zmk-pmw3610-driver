@@ -26,6 +26,18 @@ This driver had been tested on [my PMW3610 breakout board](https://github.com/ba
 - Separates sampling rate from reporting rate — accumulates XY motion data between interrupts and reports at configurable intervals (`CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN`) to reduce report count for high CPI sensors in noisy RF environments while maintaining lossless cursor tracking.
 - Deprecated reset pin control, relying on software reset via SPI commands.
 
+#### Runtime BLE report interval
+
+`CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE` is only the boot value of the BLE report interval floor. Other modules can move it at runtime:
+
+```c
+#include <zmk_pmw3610_alt/report_interval.h>
+
+pmw3610_alt_set_ble_report_interval(12); /* ms, 0 = no throttling */
+```
+
+`CONFIG_PMW3610_ALT_REPORT_INTERVAL_RUNTIME` is defined whenever this API is available. The throttle itself works on the frame grid with a sub-frame margin, so intervals that are multiples of the 4 ms frame period (4/8/12/16 ms) are held exactly instead of alternating with the next multiple.
+
 ## Installation
 
 Include this project on ZMK's west manifest in `config/west.yml`:

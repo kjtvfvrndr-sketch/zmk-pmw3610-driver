@@ -28,6 +28,7 @@
 #include <zephyr/bluetooth/conn.h>
 #endif
 #include "pmw3610.h"
+#include <zmk_pmw3610_alt/report_interval.h>
 
 #include <string.h>
 
@@ -108,6 +109,20 @@ BUILD_ASSERT(PMW3610_PERF_RUN_RATE != PMW3610_PERF_POWER_UP,
  * tail of the stroke still in progress, above it emitting it reads as a jump. */
 #define PMW3610_STALE_DELTA_MS 50
 
+/* A report is due on the first frame at least (rpt_min - PMW3610_RPT_EARLY_US)
+ * after the previous report. The interval presets (4/8/12/16 ms) are multiples
+ * of the 4 ms RUN frame period, so frames land right on the boundary, and a
+ * frame serviced a hair late would otherwise wait a whole further frame: a
+ * 4 ms setting ran as a 4/8 ms mix, 8 ms as 8/12.
+ *
+ * Sized from the same jitter PMW3610_IMPLAUSIBLE_GAP_US is sized from - the
+ * healthy minimum gap between two serviced frames sits near 2.6 ms, so
+ * servicing runs up to ~1.4 ms late. Below half the frame period, so a frame
+ * of the current stroke is never let through one interval early; the worst
+ * case is a report landing one jitter-width early, which beats one frame
+ * period late. */
+#define PMW3610_RPT_EARLY_US 1500
+
 /* Dead band around the smart-algorithm shutter threshold of 45. */
 #define PMW3610_SMART_HYST 5
 
@@ -119,9 +134,13 @@ BUILD_ASSERT(PMW3610_PERF_RUN_RATE != PMW3610_PERF_POWER_UP,
 #define PMW3610_DISCARD_MOTION_AFTER_RECONFIGURE_MS                                            \
     CONFIG_PMW3610_ALT_DISCARD_MOTION_AFTER_RECONFIGURE_MS
 
-/* Opens (or extends) the window in which motion is read and thrown away. */
+/* Opens (or extends) the window in which motion is read and thrown away.
+ * Kept in kernel ticks, like last_smp_time and the `now` of
+ * pmw3610_report_data() it is compared against: a millisecond deadline next
+ * to a tick clock would never be reached, and the window would never open. */
 static void pmw3610_discard_motion_for_a_while(struct pixart_data *data, const char *reason) {
-    data->motion_discard_until_ms = k_uptime_get() + PMW3610_DISCARD_MOTION_AFTER_RECONFIGURE_MS;
+    data->motion_discard_until_ticks =
+        k_uptime_ticks() + (int64_t)k_ms_to_ticks_ceil64(PMW3610_DISCARD_MOTION_AFTER_RECONFIGURE_MS);
     data->motion_discard_reason = reason;
 }
 
@@ -130,7 +149,7 @@ static void pmw3610_discard_motion_for_a_while(struct pixart_data *data, const c
  * itself turns ACTIVE, and the window would swallow the start of that stroke.
  * A frame within the last PMW3610_STALE_DELTA_MS says the ball is in use. */
 static void pmw3610_discard_motion_unless_moving(struct pixart_data *data, const char *reason) {
-    if (k_uptime_get() - data->last_smp_time > PMW3610_STALE_DELTA_MS) {
+    if (k_uptime_ticks() - data->last_smp_time > (int64_t)k_ms_to_ticks_ceil64(PMW3610_STALE_DELTA_MS)) {
         pmw3610_discard_motion_for_a_while(data, reason);
     }
 }
@@ -173,10 +192,28 @@ static bool pmw3610_workq_started;
 // driver never produces more reports than the link can carry.    //
 
 static atomic_t rpt_interval_min = ATOMIC_INIT(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE);
-static atomic_t ble_interval_min = ATOMIC_INIT(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE);
+
+/* BLE floor. Boots at the Kconfig value; pmw3610_alt_set_ble_report_interval()
+   moves it at runtime (zmk-ble-host-link derives it from the host link, or takes a per-profile value). */
+static atomic_t ble_floor_ms = ATOMIC_INIT(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE);
+
+#if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_PMW3610_ALT_REPORT_INTERVAL_FOLLOW_CONN)
+/* Connection interval negotiated with the host, in ms rounded up. 0 until known. */
+static atomic_t ble_conn_ms = ATOMIC_INIT(0);
+#endif
+
+/* The inputs live in separate atomics and are combined here; the lock keeps a
+   refresh that read stale inputs from landing after one that read fresh ones. */
+static struct k_spinlock rpt_lock;
 
 static void pmw3610_refresh_report_interval(void) {
-    int32_t v = atomic_get(&ble_interval_min);
+    k_spinlock_key_t key = k_spin_lock(&rpt_lock);
+
+    int32_t v = (int32_t)atomic_get(&ble_floor_ms);
+
+#if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_PMW3610_ALT_REPORT_INTERVAL_FOLLOW_CONN)
+    v = MAX(v, (int32_t)atomic_get(&ble_conn_ms));
+#endif
 
 #if IS_ENABLED(CONFIG_ZMK_USB)
     if (zmk_endpoints_selected().transport == ZMK_TRANSPORT_USB) {
@@ -184,9 +221,28 @@ static void pmw3610_refresh_report_interval(void) {
     }
 #endif
 
-    if (atomic_set(&rpt_interval_min, v) != v) {
+    const int32_t old = (int32_t)atomic_set(&rpt_interval_min, v);
+
+    k_spin_unlock(&rpt_lock, key);
+
+    if (old != v) {
         LOG_INF("Report interval min -> %d ms", v);
     }
+}
+
+void pmw3610_alt_set_ble_report_interval(uint16_t ms) {
+    if ((uint16_t)atomic_set(&ble_floor_ms, ms) != ms) {
+        LOG_INF("BLE report interval floor -> %u ms", ms);
+    }
+    pmw3610_refresh_report_interval();
+}
+
+uint16_t pmw3610_alt_get_ble_report_interval(void) {
+    return (uint16_t)atomic_get(&ble_floor_ms);
+}
+
+uint16_t pmw3610_alt_get_ble_report_interval_default(void) {
+    return CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE;
 }
 
 #if IS_ENABLED(CONFIG_BT) && IS_ENABLED(CONFIG_PMW3610_ALT_REPORT_INTERVAL_FOLLOW_CONN)
@@ -206,7 +262,7 @@ static void pmw3610_track_conn(struct bt_conn *conn) {
     /* le.interval is in 1.25 ms units; round up so the driver never emits
        reports faster than the link is able to carry them. */
     int32_t ms = ((int32_t)info.le.interval * 5 + 3) / 4;
-    atomic_set(&ble_interval_min, MAX(CONFIG_PMW3610_ALT_REPORT_INTERVAL_MIN_BLE, ms));
+    atomic_set(&ble_conn_ms, ms);
     pmw3610_refresh_report_interval();
 }
 
@@ -874,7 +930,7 @@ static int pmw3610_report_data(const struct device *dev) {
     }
 
     const int32_t rpt_min = atomic_get(&rpt_interval_min);
-    const int64_t now = k_uptime_get();
+    const int64_t now = k_uptime_ticks();
 
 	int err = pmw3610_read(dev, PMW3610_REG_MOTION_BURST, buf, PMW3610_BURST_SIZE);
     if (err) {
@@ -891,7 +947,7 @@ static int pmw3610_report_data(const struct device *dev) {
     int16_t y = TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12);
     LOG_DBG("x/y: %d/%d", x, y);
 
-    if (unlikely(now < data->motion_discard_until_ms)) {
+    if (unlikely(now < data->motion_discard_until_ticks)) {
         /* The part settling after a register write of ours. The burst read
            above has cleared it out of the sensor; counted for the log line
            the diagnostics print once the window is over, and thrown away. */
@@ -929,7 +985,8 @@ static int pmw3610_report_data(const struct device *dev) {
     // read as a jump rather than as the tail of the current stroke.  The old
     // threshold was rpt_min itself, which also discarded the residue of any
     // normal stroke the moment the frames spaced out past one report interval.
-    if (rpt_min > 0 && (now - data->last_smp_time) >= PMW3610_STALE_DELTA_MS) {
+    if (rpt_min > 0 &&
+        (now - data->last_smp_time) >= (int64_t)k_ms_to_ticks_ceil64(PMW3610_STALE_DELTA_MS)) {
         data->dx = 0;
         data->dy = 0;
     }
@@ -939,9 +996,13 @@ static int pmw3610_report_data(const struct device *dev) {
     data->dx += x;
     data->dy += y;
 
-    // strict to report inerval
-    if (rpt_min > 0 && (now - data->last_rpt_time) < rpt_min) {
-        return 0;
+    // strict to report interval, on the frame grid (see PMW3610_RPT_EARLY_US)
+    if (rpt_min > 0) {
+        const int64_t due = (int64_t)k_ms_to_ticks_floor64(rpt_min) -
+                            (int64_t)k_us_to_ticks_floor64(PMW3610_RPT_EARLY_US);
+        if ((now - data->last_rpt_time) < due) {
+            return 0;
+        }
     }
 
     // fetch report value
@@ -1195,7 +1256,7 @@ static void pmw3610_diag_dump(struct k_work *work) {
         }
     }
 
-    if (data->motion_discarded_frames > 0 && k_uptime_get() >= data->motion_discard_until_ms) {
+    if (data->motion_discarded_frames > 0 && k_uptime_ticks() >= data->motion_discard_until_ticks) {
         LOG_INF("motion discarded after %s: %u frames, dx %d dy %d",
                 data->motion_discard_reason, data->motion_discarded_frames,
                 data->motion_discarded_dx, data->motion_discarded_dy);
